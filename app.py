@@ -958,16 +958,42 @@ st.divider()
 # Sidebar controls
 with st.sidebar:
     st.header("Upload & Settings")
+
     uploaded = st.file_uploader("Upload a credit bureau PDF", type=["pdf"])
 
-    st.session_state["user_score"] = st.number_input(
-        "If you know the current score, enter it (optional)",
-        min_value=300, max_value=850, value=0, step=1,
-        help="If left blank (0), the app estimates a score range from the parsed credit report."
+    # Optional Known Score Toggle (FIXES STREAMLIT ERROR)
+    use_known_score = st.checkbox(
+        "I know the current credit score (optional)",
+        value=False
     )
-    user_score_val = None if st.session_state["user_score"] in [0, None] else int(st.session_state["user_score"])
 
-    goal_score = st.selectbox("Goal score", [620, 660, 680, 700], index=3)
+    if use_known_score:
+        user_score_val = st.number_input(
+            "Current credit score",
+            min_value=300,
+            max_value=850,
+            value=680,
+            step=1,
+        )
+        user_score_val = int(user_score_val)
+    else:
+        user_score_val = None
+
+    goal_score = st.selectbox(
+        "Goal score",
+        [620, 660, 680, 700],
+        index=3
+    )
+
+    st.subheader("OCR Safety")
+    st.write(f"Max OCR pages: **{MAX_PAGES_OCR}**")
+    st.caption("Large PDFs can be slow on Streamlit Cloud. OCR pages are capped for reliability.")
+
+    run_btn = st.button(
+        "Process PDF",
+        type="primary",
+        use_container_width=True
+    )
 
     st.subheader("OCR Safety")
     st.write(f"Max OCR pages: **{MAX_PAGES_OCR}**")
