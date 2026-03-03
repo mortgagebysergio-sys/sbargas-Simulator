@@ -360,9 +360,63 @@ def tradelines_to_df(lines: List[Tradeline]) -> pd.DataFrame:
     return df
 
 
-def df_to_tradelines(df: pd.DataFrame) -> List[Tradeline]:
-    out = []
+def df_to_tradelines(obj) -> List[Tradeline]:
+    """
+    Accepts either:
+      - pandas DataFrame (preferred)
+      - list[dict] or list[Tradeline] (fallback)
+    Returns list[Tradeline].
+    """
+    # If already a list of Tradeline objects, return as-is
+    if isinstance(obj, list) and len(obj) > 0 and isinstance(obj[0], Tradeline):
+        return obj
+
+    # If list of dicts, convert to DataFrame
+    if isinstance(obj, list):
+        try:
+            obj = pd.DataFrame(obj)
+        except Exception:
+            return []
+
+    # If it's not a DataFrame by now, bail out safely
+    if not isinstance(obj, pd.DataFrame):
+        return []
+
+    df = obj
+
+    out: List[Tradeline] = []
     for _, r in df.iterrows():
+        creditor = str(r.get("creditor", "") or "").strip()
+        acct = str(r.get("account_last4", "") or "").strip()
+        bureau = str(r.get("bureau", "") or "").strip()
+
+        # balance
+        bal = r.get("balance", None)
+        bal_f = None
+        try:
+            if bal is not None and not pd.isna(bal) and str(bal).strip() != "":
+                bal_f = float(str(bal).replace("$", "").replace(",", "").strip())
+        except Exception:
+            bal_f = None
+
+        last_rep = str(r.get("last_reported", "") or "").strip()
+        opened = str(r.get("opened", "") or "").strip()
+        status = str(r.get("status", "") or "").strip()
+        notes = str(r.get("notes", "") or "").strip()
+
+        out.append(
+            Tradeline(
+                creditor=creditor,
+                account_last4=acct,
+                bureau=bureau,
+                balance=bal_f,
+                last_reported=last_rep,
+                opened=opened,
+                status=status,
+                notes=notes,
+            )
+        )
+    return out
         bal = r.get("balance", None)
         if pd.isna(bal) or bal == "":
             bal_f = None
