@@ -13,10 +13,15 @@ import pdfplumber
 @dataclass
 class Tradeline:
     creditor: str
+    account_number: str = ""
     account_type: str = "Unknown"
+    status: str = "Unknown"
+    opened_date: str = ""
+    last_reported_date: str = ""
+    chargeoff_date: str = ""
+    last_late_date: str = ""
     balance: Optional[float] = None
     limit: Optional[float] = None
-    status: str = "Unknown"
     past_due: Optional[float] = None
     remarks: str = ""
 
@@ -48,6 +53,10 @@ def parse_money(s: str) -> Optional[float]:
         return None
 
 
+def normalize_spaces(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+
 def extract_text_from_pdf(file) -> str:
     text_parts = []
     with pdfplumber.open(file) as pdf:
@@ -58,91 +67,169 @@ def extract_text_from_pdf(file) -> str:
     return "\n".join(text_parts)
 
 
-# =========================
-# Tradeline Extraction (tuned to your merged report style)
-# =========================
-def extract_tradelines_from_birchwood_style(text: str) -> List[Tradeline]:
+def extract_first_date(text: str) -> str:
     """
-    This parser is tuned for the merged/mortgage-style report you uploaded:
-    - Finds TRADELINES section
-    - Stops before TRADE SUMMARY
-    - Splits accounts by creditor header lines (usually ALL CAPS)
-    - Extracts basic fields: balance/limit/past_due/status/type/remarks
+    Extracts a date-like token. Handles common formats:
+    01/15/2024, 01/2024, 2024-01-15
+    """
+    if not text:
+        return ""
+    t = text.strip()
+
+    m = re.search(r"\b(\d{1,2}/\d{1,2}/\d{2,4})\b", t)
+    if m:
+        return m.group(1)
+
+    m = re.search(r"\b(\d{1,2}/\d{4})\b", t)  # MM/YYYY
+    if m:
+        return m.group(1)
+
+    m = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", t)
+    if m:
+        return m.group(1)
+
+    return ""
+
+
+def mask_account_number(acct: str) -> str:
+    """
+    Keep last 4 digits if possible.
+    """
+    acct = normalize_spaces(acct)
+    if not acct:
+        return ""
+    digits = re.sub(r"\D", "", acct)
+    if len(digits) >= 4:
+        return f"****{digits[-4:]}"
+    return acct[:12]
+
+
+# =========================
+# Tradeline Extraction (tuned + expanded fields)
+# =========================
+def extract_tradelines_from_report(text: str) -> List[Tradeline]:
+    """
+    Tuned for the mortgage merged report style you uploaded:
+    - Focus TRADELINES section
+    - Split by creditor header (mostly uppercase)
+    - Parse: creditor, acct#, opened, last reported, chargeoff/last late, balance, limit, past due, type, status
     """
 
     upper = text.upper()
-
     start = upper.find("TRADELINES")
-    if start == -1:
-        tradeline_text = text
-    else:
-        tradeline_text = text[start:]
+    tradeline_text = text[start:] if start != -1 else text
 
     upper_t = tradeline_text.upper()
     end = upper_t.find("TRADE SUMMARY")
     if end != -1:
         tradeline_text = tradeline_text[:end]
 
-    # Line cleanup
     raw_lines = tradeline_text.splitlines()
-    lines = [ln.strip() for ln in raw_lines if ln.strip()]
-
+    lines = [ln.rstrip() for ln in raw_lines if ln.strip()]
     if not lines:
         return []
 
     def looks_like_creditor_line(ln: str) -> bool:
-        # Creditors in this report are typically ALL CAPS and short-ish
-        if len(ln) < 3 or len(ln) > 38:
+        s = ln.strip()
+        if len(s) < 3 or len(s) > 42:
             return False
 
-        # Avoid section header lines
-        bad_headers = [
+        # Avoid non-creditor headers
+        bad_exact = {
             "TRADELINES", "TRADE SUMMARY", "DEROGATORY SUMMARY",
             "OPENED", "REPORTED", "REVIEWED", "HI. CREDIT", "HIGH CREDIT",
             "CREDIT LIMIT", "PAST DUE", "BALANCE", "PAYMENT", "ECOA",
             "SOURCE", "ACCOUNT", "MONTHS", "DLA"
-        ]
-        if any(b == ln.upper() for b in bad_headers):
+        }
+        if s.upper() in bad_exact:
             return False
 
         # Must contain letters
-        letters = [c for c in ln if c.isalpha()]
+        letters = [c for c in s if c.isalpha()]
         if not letters:
             return False
 
-        # Mostly uppercase ratio
+        # mostly uppercase letters
         upper_ratio = sum(1 for c in letters if c.isupper()) / max(1, len(letters))
-
-        # Filter out a few non-creditor lines that are still uppercase
-        blacklist_contains = ["EXPERIAN", "EQUIFAX", "TRANSUNION", "CREDIT", "REPORT"]
-        if any(x in ln.upper() for x in blacklist_contains):
+        if upper_ratio < 0.85:
             return False
 
-        return upper_ratio >= 0.85
+        # blacklist common non-creditor uppercase lines
+        if any(x in s.upper() for x in ["EXPERIAN", "EQUIFAX", "TRANSUNION", "CREDIT REPORT"]):
+            return False
 
-    # Find the indices where each tradeline begins
-    starts = []
-    for i, ln in enumerate(lines):
-        if looks_like_creditor_line(ln):
-            starts.append(i)
+        return True
 
+    # Find block starts
+    starts = [i for i, ln in enumerate(lines) if looks_like_creditor_line(ln)]
     if not starts:
         return []
 
-    # Build blocks
     blocks = []
     for idx, s in enumerate(starts):
         e = starts[idx + 1] if idx + 1 < len(starts) else len(lines)
-        block = "\n".join(lines[s:e]).strip()
+        block = "\n".join([ln.strip() for ln in lines[s:e]]).strip()
         if len(block) >= 50:
             blocks.append(block)
 
     tradelines: List[Tradeline] = []
 
     for b in blocks:
-        b_up = b.upper()
+        b_norm = normalize_spaces(b)
+        b_up = b_norm.upper()
+
+        # Creditor is first line of original block (safer than regex)
         first_line = b.splitlines()[0].strip()
-        creditor = first_line
+        creditor = normalize_spaces(first_line)
+
+        # Account number: look for "ACCOUNT" or patterns like "ACCT" or "ACCOUNT #"
+        acct = ""
+        m = re.search(r"\b(ACCOUNT|ACCT)\s*(#|NUMBER|NO\.?)?\s*[:\-]?\s*([A-Z0-9\*\-]{4,30})\b", b_up)
+        if m:
+            acct = m.group(3)
+        else:
+            # Some reports show account number immediately under creditor line
+            # Try second line if it contains digits/asterisks
+            blines = [normalize_spaces(x) for x in b.splitlines() if x.strip()]
+            if len(blines) >= 2:
+                if re.search(r"[\d\*]{4,}", blines[1]):
+                    acct = blines[1]
+
+        acct_masked = mask_account_number(acct)
+
+        # Dates: Opened / Reported / Charge-off / Last late
+        opened_date = ""
+        last_reported = ""
+        chargeoff_date = ""
+        last_late_date = ""
+
+        # These labels vary; we try a few
+        def find_date_after(label_pat: str) -> str:
+            m = re.search(label_pat + r"\s*[:\-]?\s*([^\|]{0,30})", b_up)
+            if not m:
+                return ""
+            return extract_first_date(m.group(1))
+
+        opened_date = find_date_after(r"\bOPENED\b")
+        last_reported = find_date_after(r"\b(REPORTED|LAST REPORTED)\b")
+        chargeoff_date = find_date_after(r"\b(CHARGE\s*OFF|CHARGED\s*OFF)\b")
+        last_late_date = find_date_after(r"\b(LAST\s+LATE\s+DATE|LAST\s+LATE)\b")
+
+        # Money fields
+        bal = None
+        m = re.search(r"\bBALANCE\b\s*\$?\s*([\d,]+)", b_up)
+        if m:
+            bal = parse_money(m.group(1))
+
+        lim = None
+        m = re.search(r"\bCREDIT\s*LIMIT\b\s*\$?\s*([\d,]+)", b_up)
+        if m:
+            lim = parse_money(m.group(1))
+
+        past_due = None
+        m = re.search(r"\bPAST\s*DUE\b\s*\$?\s*([\d,]+)", b_up)
+        if m:
+            past_due = parse_money(m.group(1))
 
         # Type detection
         acct_type = "Unknown"
@@ -151,49 +238,30 @@ def extract_tradelines_from_birchwood_style(text: str) -> List[Tradeline]:
                 acct_type = t.title()
                 break
 
-        # Balance
-        bal = None
-        m = re.search(r"\bBALANCE\b\s*\$?\s*([\d,]+)", b_up)
-        if m:
-            bal = parse_money(m.group(1))
-
-        # Credit Limit
-        lim = None
-        m = re.search(r"\bCREDIT LIMIT\b\s*\$?\s*([\d,]+)", b_up)
-        if m:
-            lim = parse_money(m.group(1))
-
-        # Past Due
-        past_due = None
-        m = re.search(r"\bPAST DUE\b\s*\$?\s*([\d,]+)", b_up)
-        if m:
-            past_due = parse_money(m.group(1))
-
-        # Status inference
+        # Status inference (expanded)
         status = "Unknown"
         if "CHARGE OFF" in b_up or "CHARGED OFF" in b_up or "CHARGEOFF" in b_up:
             status = "Charge Off"
         elif "COLLECTION" in b_up:
             status = "Collection"
+        elif "PAST DUE" in b_up or (past_due or 0) > 0:
+            status = "Past Due / Delinquent"
         elif "CUR WAS" in b_up:
             status = "Current (prior delinquency: CUR WAS)"
         elif "PD WAS" in b_up:
             status = "Current (prior delinquency: PD WAS)"
-        elif "PAST DUE" in b_up or (past_due or 0) > 0:
-            status = "Past Due / Delinquent"
         elif "AS AGREED" in b_up or "PAID" in b_up:
             status = "As Agreed / Paid"
 
-        # Remarks (light extraction)
+        # Remarks (pull key phrases)
         remarks = []
         notable_phrases = [
             "ACCOUNT INFORMATION DISPUTED BY CONSUMER",
             "PROFIT AND LOSS WRITEOFF",
             "CHARGED OFF ACCOUNT",
-            "LAST LATE DATE",
             "COLLECTION ACCOUNT",
             "CLOSED",
-            "AUTHORIZED USER"
+            "AUTHORIZED USER",
         ]
         for ph in notable_phrases:
             if ph in b_up:
@@ -202,12 +270,17 @@ def extract_tradelines_from_birchwood_style(text: str) -> List[Tradeline]:
         tradelines.append(
             Tradeline(
                 creditor=creditor,
+                account_number=acct_masked,
                 account_type=acct_type,
+                status=status,
+                opened_date=opened_date,
+                last_reported_date=last_reported,
+                chargeoff_date=chargeoff_date,
+                last_late_date=last_late_date,
                 balance=bal,
                 limit=lim,
-                status=status,
                 past_due=past_due,
-                remarks="; ".join(remarks)
+                remarks="; ".join(remarks),
             )
         )
 
@@ -215,7 +288,15 @@ def extract_tradelines_from_birchwood_style(text: str) -> List[Tradeline]:
     seen = set()
     uniq = []
     for t in tradelines:
-        key = (t.creditor.lower().strip(), (t.status or "").lower().strip(), t.balance, t.limit, t.past_due)
+        key = (
+            t.creditor.lower().strip(),
+            t.account_number.strip(),
+            (t.status or "").lower().strip(),
+            t.balance,
+            t.limit,
+            t.past_due,
+            t.last_reported_date,
+        )
         if key in seen:
             continue
         seen.add(key)
@@ -225,7 +306,7 @@ def extract_tradelines_from_birchwood_style(text: str) -> List[Tradeline]:
 
 
 # =========================
-# Negative Account Detection
+# Negative Detection
 # =========================
 def is_negative_tradeline(t: Tradeline) -> bool:
     s = (t.status or "").upper()
@@ -240,7 +321,7 @@ def is_negative_tradeline(t: Tradeline) -> bool:
 
 
 # =========================
-# Conservative Scoring Logic (NOT FICO)
+# Conservative scoring (NOT FICO)
 # =========================
 UTIL_TIERS = [
     (0.09, (12, 30)),
@@ -277,7 +358,7 @@ def estimate_overall_utilization(tradelines: List[Tradeline]) -> Optional[float]
 def generate_recommendations(tradelines: List[Tradeline]) -> List[Recommendation]:
     recs: List[Recommendation] = []
 
-    # Global utilization actions
+    # Global utilization
     util = estimate_overall_utilization(tradelines)
     if util is not None:
         current_pts = utilization_points(util)
@@ -286,19 +367,18 @@ def generate_recommendations(tradelines: List[Tradeline]) -> List[Recommendation
                 new_pts = utilization_points(target)
                 low_gain = clamp(new_pts[0] - current_pts[1], 0, 60)
                 high_gain = clamp(new_pts[1] - current_pts[0], 0, 80)
-
                 recs.append(
                     Recommendation(
                         action=f"Pay down revolving utilization to ≤ {int(target*100)}% (tier crossing)",
                         target="Overall revolving utilization",
                         estimated_points_low=low_gain,
                         estimated_points_high=high_gain,
-                        why="Utilization tier crossings are among the most reliable short-term score movers once balances report.",
+                        why="Utilization tier crossings are typically the fastest conservative score wins once balances report.",
                         timeline_days=30,
                     )
                 )
 
-    # Per-negative account actions
+    # Per negative tradeline
     for t in tradelines:
         if not is_negative_tradeline(t):
             continue
@@ -306,62 +386,62 @@ def generate_recommendations(tradelines: List[Tradeline]) -> List[Recommendation
         s = (t.status or "").upper()
         pd_amt = t.past_due or 0
 
-        # Active past due / delinquent
+        # Past due
         if pd_amt > 0 or "PAST DUE" in s or "DELINQUENT" in s:
             recs.append(
                 Recommendation(
                     action="Bring account current (pay past-due / establish repayment) and keep current",
-                    target=t.creditor,
+                    target=f"{t.creditor} ({t.account_number})".strip(),
                     estimated_points_low=15,
                     estimated_points_high=45,
-                    why="Active delinquency is one of the most punishing mortgage-risk signals. Updating to current can help once it reports.",
+                    why="Active delinquency is a strong mortgage risk factor. Getting current can help once it updates.",
                     timeline_days=30,
                 )
             )
 
-        # Collections
+        # Collection
         if "COLLECTION" in s:
             recs.append(
                 Recommendation(
-                    action="Attempt Pay-For-Delete (best); if not possible, settle and verify it updates to paid/$0",
-                    target=t.creditor,
+                    action="Attempt Pay-For-Delete (best); if not possible, settle and verify update to paid/$0",
+                    target=f"{t.creditor} ({t.account_number})".strip(),
                     estimated_points_low=5,
                     estimated_points_high=25,
-                    why="Deletion usually helps more than ‘paid collection’, but results vary by file thickness and bureau reporting.",
+                    why="Deletion usually helps more than ‘paid’, but impact varies. Ensure reporting updates and avoid dispute remarks during underwriting.",
                     timeline_days=60,
                 )
             )
 
-        # Charge-offs
+        # Charge-off
         if "CHARGE OFF" in s:
             recs.append(
                 Recommendation(
                     action="Negotiate delete/removal of derogatory remarks; otherwise settle and ensure balance updates to $0",
-                    target=t.creditor,
+                    target=f"{t.creditor} ({t.account_number})".strip(),
                     estimated_points_low=3,
                     estimated_points_high=18,
-                    why="Charge-offs can remain; best-case is deletion. Balance-to-$0 and remark cleanup can modestly improve scoring and underwriting.",
+                    why="Charge-offs can remain; best-case is deletion. Balance-to-$0 and remark cleanup can help modestly and supports underwriting.",
                     timeline_days=60,
                 )
             )
 
-        # Prior delinquency indicators
+        # Prior delinquency markers
         if "CUR WAS" in s or "PD WAS" in s:
             recs.append(
                 Recommendation(
-                    action="If accurate, no quick delete: focus on perfect payments + reduce utilization + resolve other derogatories first",
-                    target=t.creditor,
+                    action="If accurate, no quick delete: focus on perfect payments + reduce utilization + resolve active derogatories first",
+                    target=f"{t.creditor} ({t.account_number})".strip(),
                     estimated_points_low=0,
                     estimated_points_high=12,
-                    why="Accurate lates are hard to remove. Most short-term improvement comes from utilization and resolving active derogatories.",
+                    why="Accurate lates are hard to remove quickly. Short-term gains usually come from utilization and resolving active derogatories.",
                     timeline_days=90,
                 )
             )
 
-    # Rank highest upside first
+    # Rank
     recs.sort(key=lambda x: (x.estimated_points_high, x.estimated_points_low), reverse=True)
 
-    # De-dupe exact duplicates
+    # De-dupe
     seen = set()
     out = []
     for r in recs:
@@ -370,7 +450,6 @@ def generate_recommendations(tradelines: List[Tradeline]) -> List[Recommendation
             continue
         seen.add(key)
         out.append(r)
-
     return out
 
 
@@ -389,13 +468,15 @@ def project_scores(base_score: int, recs: List[Recommendation]) -> Dict[int, Tup
 
 
 # =========================
-# Streamlit UI
+# UI
 # =========================
 st.set_page_config(page_title="Mortgage Credit Simulator (Conservative)", layout="wide")
 st.title("Mortgage Credit Simulator (Conservative, Non-FICO)")
+
 st.caption(
     "Upload a mortgage-style credit report PDF. The app extracts tradelines (best-effort), "
-    "shows negative accounts, ranks recommended actions by expected impact, and estimates 30/60/90-day score ranges."
+    "lists negative accounts with key fields (account #, last reported, etc.), "
+    "and generates a ranked action plan + 30/60/90 projections."
 )
 
 left, right = st.columns([2, 1], gap="large")
@@ -408,11 +489,10 @@ with right:
         value=660,
         step=1
     )
-
     st.divider()
     st.markdown("### Notes")
     st.write("- This is a conservative simulator, not an official FICO model.")
-    st.write("- Text-based PDFs work best. Scanned PDFs may require OCR (can be added later).")
+    st.write("- Text-based PDFs work best. Scanned PDFs may require OCR (optional).")
 
 with left:
     pdf = st.file_uploader("Upload credit report PDF", type=["pdf"])
@@ -429,27 +509,22 @@ with left:
     with st.expander("Preview extracted text (first 2,000 characters)"):
         st.code(text[:2000])
 
-    with st.spinner("Parsing tradelines from report…"):
-        tradelines = extract_tradelines_from_birchwood_style(text)
+    with st.spinner("Parsing tradelines…"):
+        tradelines = extract_tradelines_from_report(text)
 
     if not tradelines:
-        st.error(
-            "No tradelines were detected. This usually means the report format is different or the PDF text extraction is limited."
-        )
+        st.error("No tradelines detected. If this report format differs, we can tune the parser.")
         st.stop()
 
     negative_lines = [t for t in tradelines if is_negative_tradeline(t)]
 
-    st.subheader("Detected tradelines (debug view)")
-    st.write(f"Total tradelines parsed: **{len(tradelines)}**")
-    st.dataframe([asdict(t) for t in tradelines], use_container_width=True)
-
     st.subheader("Negative accounts detected")
-    st.write(f"Negative tradelines found: **{len(negative_lines)}**")
+    st.write(f"Total tradelines parsed: **{len(tradelines)}** | Negative tradelines: **{len(negative_lines)}**")
+
     if negative_lines:
         st.dataframe([asdict(t) for t in negative_lines], use_container_width=True)
     else:
-        st.info("No negative tradelines detected by the current rules. If this is incorrect, we can tune the markers.")
+        st.info("No negative tradelines detected by current rules.")
 
     recs = generate_recommendations(tradelines)
 
@@ -479,10 +554,3 @@ with left:
                 f"(~{r.timeline_days} days)\n"
                 f"  - Why: {r.why}"
             )
-
-    st.divider()
-    st.subheader("Quick troubleshooting")
-    st.write(
-        "If you still only see 1 tradeline, it usually means the PDF text extraction is collapsing lines. "
-        "Try a different export of the report (text-selectable), or we’ll add OCR support."
-    )
