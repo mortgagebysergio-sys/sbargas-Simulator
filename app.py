@@ -358,7 +358,60 @@ def tradelines_to_df(lines: List[Tradeline]) -> pd.DataFrame:
             "last_reported", "opened_date", "status", "bureaus", "account_type", "notes"
         ])
     return df
-    
+    def df_to_tradelines(obj) -> List[Tradeline]:
+    """
+    Accepts either:
+      - pandas DataFrame (preferred)
+      - list[dict] or list[Tradeline] (fallback)
+    Returns list[Tradeline].
+    """
+    # Already a list of Tradeline objects
+    if isinstance(obj, list) and len(obj) > 0 and isinstance(obj[0], Tradeline):
+        return obj
+
+    # list of dicts -> DataFrame
+    if isinstance(obj, list):
+        try:
+            obj = pd.DataFrame(obj)
+        except Exception:
+            return []
+
+    # Must be DataFrame now
+    if not isinstance(obj, pd.DataFrame):
+        return []
+
+    df = obj.copy()
+
+    out: List[Tradeline] = []
+    for _, r in df.iterrows():
+        # balance
+        bal = r.get("balance", None)
+        bal_f = None
+        try:
+            if bal is not None and not pd.isna(bal) and str(bal).strip() != "":
+                bal_f = float(str(bal).replace("$", "").replace(",", "").strip())
+        except Exception:
+            bal_f = None
+
+        # account number: prefer full, else last4
+        acct_full = str(r.get("account_number", "") or "").strip()
+        acct_last4 = str(r.get("account_last4", "") or "").strip()
+        acct_num = acct_full if acct_full else acct_last4
+
+        out.append(
+            Tradeline(
+                creditor_name=str(r.get("creditor_name", "") or "").strip(),
+                account_number=acct_num,
+                balance=bal_f,
+                last_reported=str(r.get("last_reported", "") or "").strip(),
+                opened_date=str(r.get("opened_date", "") or "").strip(),
+                status=str(r.get("status", "") or "").strip(),
+                bureaus=str(r.get("bureaus", "") or "").strip(),
+                account_type=str(r.get("account_type", "") or "").strip(),
+                notes=str(r.get("notes", "") or "").strip(),
+            )
+        )
+    return out
     """
     Accepts either:
       - pandas DataFrame (preferred)
@@ -1134,13 +1187,11 @@ if PII_MASK:
 # ----------------------------
 # Top Metrics
 # ----------------------------
-neg_counts = summarize_negatives(if isinstance(working_df, list):     working_df = pd.DataFrame(working_df)(working_df.fillna("").to_dict(orient="records") if isinstance(working_df, pd.DataFrame) else []))
+
 # Better: compute from df directly
 collections_ct = int((working_df["status"] == "collection").sum()) if "status" in working_df.columns else 0
 chargeoffs_ct = int((working_df["status"] == "charge_off").sum()) if "status" in working_df.columns else 0
 lates_ct = int((working_df["status"] == "late").sum()) if "status" in working_df.columns else 0
-
-score_lo, score_hi, score_info = baseline_score_range(if isinstance(working_df, list):     working_df = pd.DataFrame(working_df)(working_df.assign(balance=working_df.get("balance", "")).fillna("").to_dict(orient="records")), user_score_val)
 
 # Utilization (optional)
 def coerce_float(x):
@@ -1213,56 +1264,113 @@ with tab_parsed:
             working_df[c] = ""
 
     # Show editor with safer defaults
-    edited = st.data_editor(
-        working_df[editable_cols],
-        use_container_width=True,
-        num_rows="dynamic",
-        column_config={
-            "balance": st.column_config.NumberColumn(format="%.2f"),
-            "credit_limit": st.column_config.NumberColumn(format="%.2f", help="Optional. Helps utilization calculations."),
-            "status": st.column_config.SelectboxColumn(
-                options=["ok", "collection", "charge_off", "late", "repossession", "bankruptcy", "foreclosure", "judgment"],
-                help="Set the correct negative status for best recommendations."
-            ),
-            "account_type": st.column_config.SelectboxColumn(
-                options=["unknown", "revolving", "installment"],
-                help="Set to 'revolving' for credit cards so utilization math works."
-            ),
-            "is_negative": st.column_config.CheckboxColumn(help="Mark if this account should be treated as negative."),
-        },
-        key="editor",
-    )
+   # ----------------------------
+# Parsed Accounts Editor
+# ----------------------------
+with tab_accounts:
 
-    st.session_state["edited_df"] = edited.copy()
+    # Make sure working_df is always a DataFrame
+    
+        working_df = pd.DataFrame(working_df)
 
-    st.success("Manual Fix saved in session. (Nothing is stored to disk; refresh resets unless you re-upload.)")
+    if working_df is None or working_df.empty:
+        st.info("No accounts parsed yet. Upload a PDF first.")
+    else:
+        edited = st.data_editor(
+            working_df[editable_cols].copy(),
+            use_container_width=True,
+            num_rows="dynamic",
+            column_config={
+                "balance": st.column_config.NumberColumn(format="%.2f"),
+                "credit_limit": st.column_config.NumberColumn(
+                    format="%.2f",
+                    help="Optional. Helps utilization calculations."
+                ),
+                "status": st.column_config.SelectboxColumn(
+                    options=[
+                        "ok", "collection", "charge_off",
+                        "late", "repossession", "bankruptcy",
+                        "foreclosure", "judgment"
+                    ],
+                    help="Set correct negative status for best recommendations."
+                ),
+                "account_type": st.column_config.SelectboxColumn(
+                    options=["unknown", "revolving", "installment"],
+                    help="Set to 'revolving' for credit cards so utilization math works."
+                ),
+                "is_negative": st.column_config.CheckboxColumn(
+                    help="Mark if this account should be treated as negative."
+                ),
+            },
+            key="editor"
+        )
+
+        st.session_state["edited_df"] = edited.copy()
+        st.success("Manual Fix saved in session.")
+
 
 # ----------------------------
 # Recommendations
 # ----------------------------
 with tab_recs:
+
     st.subheader("Recommendations & Rapid Rescore Plan")
 
-    # Build negative list
-    df_work = st.session_state["edited_df"] if st.session_state["edited_df"] is not None else base_df
-    df_work = df_work.copy()
+    # Get working dataframe safely
+    df_work = st.session_state.get("edited_df", None)
 
-    # Normalize status/is_negative
-    if "is_negative" not in df_work.columns:
-        df_work["is_negative"] = df_work["status"].astype(str).str.lower().ne("ok")
-
-    neg_df = df_work[df_work["is_negative"] == True].copy()
-    neg_df["account_last4"] = neg_df["account_number"].apply(lambda s: mask_account_number(str(s)))
-
-    if neg_df.empty:
-        st.info("No negative accounts flagged. If something is negative but parsed as OK, go to **Parsed Accounts** and set status / is_negative.")
+    if df_work is None:
+        df_work = base_df.copy()
     else:
-        # Bad Accounts list
-        st.markdown("### Bad Accounts")
-        bad_cols = ["creditor_name", "account_last4", "balance", "last_reported", "status", "bureaus"]
-        show_bad = neg_df[bad_cols].copy()
-        st.dataframe(show_bad, use_container_width=True, hide_index=True)
+        df_work = pd.DataFrame(df_work).copy()
 
+    if df_work.empty:
+        st.info("No accounts available.")
+    else:
+
+        # Normalize negative flag
+        if "is_negative" not in df_work.columns:
+            df_work["is_negative"] = (
+                df_work["status"]
+                .astype(str)
+                .str.lower()
+                .ne("ok")
+            )
+
+        neg_df = df_work[df_work["is_negative"] == True].copy()
+
+        if "account_number" in neg_df.columns:
+            neg_df["account_last4"] = neg_df["account_number"].astype(str).apply(
+                lambda s: mask_account_number(s)
+            )
+
+        if neg_df.empty:
+            st.info(
+                "No negative accounts flagged. "
+                "If something is negative but parsed as OK, "
+                "go to Parsed Accounts and adjust status."
+            )
+        else:
+            st.markdown("### Bad Accounts")
+
+            bad_cols = [
+                "creditor_name",
+                "account_last4",
+                "balance",
+                "last_reported",
+                "status",
+                "bureaus"
+            ]
+
+            existing_cols = [c for c in bad_cols if c in neg_df.columns]
+
+            show_bad = neg_df[existing_cols].copy()
+
+            st.dataframe(
+                show_bad,
+                use_container_width=True,
+                hide_index=True
+            )
         st.markdown("### Account-by-account actions")
         for _, row in neg_df.iterrows():
             tl = Tradeline(
