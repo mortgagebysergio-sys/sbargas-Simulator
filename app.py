@@ -989,12 +989,6 @@ with st.sidebar:
     st.write(f"Max OCR pages: **{MAX_PAGES_OCR}**")
     st.caption("Large PDFs can be slow on Streamlit Cloud. OCR pages are capped for reliability.")
 
-    run_btn = st.button(
-        "Process PDF",
-        type="primary",
-        use_container_width=True
-    )
-
     st.subheader("OCR Safety")
     st.write(f"Max OCR pages: **{MAX_PAGES_OCR}**")
     st.caption("Large PDFs can be slow on Streamlit Cloud. If your report is long, OCR will cap pages for reliability.")
