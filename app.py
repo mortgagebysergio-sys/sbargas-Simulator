@@ -67,52 +67,42 @@ def extract_text_from_pdf(file) -> str:
     return "\n".join(text_parts)
 
 
-def extract_first_date(text: str) -> str:
-    """
-    Extracts a date-like token. Handles common formats:
-    01/15/2024, 01/2024, 2024-01-15
-    """
-    if not text:
+def mask_account_number(raw: str) -> str:
+    raw = normalize_spaces(raw)
+    if not raw:
         return ""
-    t = text.strip()
-
-    m = re.search(r"\b(\d{1,2}/\d{1,2}/\d{2,4})\b", t)
-    if m:
-        return m.group(1)
-
-    m = re.search(r"\b(\d{1,2}/\d{4})\b", t)  # MM/YYYY
-    if m:
-        return m.group(1)
-
-    m = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", t)
-    if m:
-        return m.group(1)
-
-    return ""
-
-
-def mask_account_number(acct: str) -> str:
-    """
-    Keep last 4 digits if possible.
-    """
-    acct = normalize_spaces(acct)
-    if not acct:
-        return ""
-    digits = re.sub(r"\D", "", acct)
+    digits = re.sub(r"\D", "", raw)
     if len(digits) >= 4:
         return f"****{digits[-4:]}"
-    return acct[:12]
+    return raw[:12]
+
+
+def extract_first_mm_yy(s: str) -> str:
+    # captures MM/YY or MM/YYYY
+    m = re.search(r"\b(\d{2}/\d{2,4})\b", s)
+    return m.group(1) if m else ""
 
 
 # =========================
-# Tradeline Extraction (tuned + expanded fields)
+# Tuned Tradeline Parser (for YOUR PDF layout)
 # =========================
 def extract_tradelines_from_report(text: str) -> List[Tradeline]:
     """
-    Tuned for the mortgage merged report style you uploaded:
-    - Focus TRADELINES section
-    - Split by creditor header (mostly uppercase)
-    - Parse: creditor, acct#, opened, last reported, chargeoff/last late, balance, limit, past due, type, status
+    Tuned to the exact mortgage merged report you uploaded.
+
+    Strategy:
+    1) Focus on TRADELINES section (stop at TRADE SUMMARY)
+    2) Split into 'units' using repeated header:
+       'Opened Reported Hi. Credit Credit Limit Reviewed ...'
+    3) For each unit:
+       - Find the first table row (line containing two MM/YY dates and at least one $ amount)
+       - Extract opened_date, last_reported_date, balance (last $ amount in that row)
+       - Extract creditor name:
+          a) If first data line starts with text before a date, use that text
+          b) If first line starts with a date, look for a later creditor line (text + date or text-only)
+          c) Append continuation creditor line (like AUTO FINAN) when appropriate
+       - Extract account number: first long digit token (>= 8 digits) in the unit
+       - Extract chargeoff date from "CHARGE OFF 6/23" or "CHARGED OFF 6/23"
     """
 
     upper = text.upper()
@@ -124,147 +114,193 @@ def extract_tradelines_from_report(text: str) -> List[Tradeline]:
     if end != -1:
         tradeline_text = tradeline_text[:end]
 
-    raw_lines = tradeline_text.splitlines()
-    lines = [ln.rstrip() for ln in raw_lines if ln.strip()]
-    if not lines:
-        return []
+    # Split into units by repeating header
+    header_pat = r"Opened Reported Hi\. Credit Credit Limit Reviewed 30-59 60-89 90\+ Past Due Payment Balance"
+    splits = re.split(header_pat, tradeline_text)
 
-    def looks_like_creditor_line(ln: str) -> bool:
-        s = ln.strip()
-        if len(s) < 3 or len(s) > 42:
-            return False
+    # If split fails (format slightly different), fallback to older behavior
+    if len(splits) <= 1:
+        splits = re.split(r"Opened Reported Hi\. Credit", tradeline_text)
 
-        # Avoid non-creditor headers
-        bad_exact = {
-            "TRADELINES", "TRADE SUMMARY", "DEROGATORY SUMMARY",
-            "OPENED", "REPORTED", "REVIEWED", "HI. CREDIT", "HIGH CREDIT",
-            "CREDIT LIMIT", "PAST DUE", "BALANCE", "PAYMENT", "ECOA",
-            "SOURCE", "ACCOUNT", "MONTHS", "DLA"
-        }
-        if s.upper() in bad_exact:
-            return False
-
-        # Must contain letters
-        letters = [c for c in s if c.isalpha()]
-        if not letters:
-            return False
-
-        # mostly uppercase letters
-        upper_ratio = sum(1 for c in letters if c.isupper()) / max(1, len(letters))
-        if upper_ratio < 0.85:
-            return False
-
-        # blacklist common non-creditor uppercase lines
-        if any(x in s.upper() for x in ["EXPERIAN", "EQUIFAX", "TRANSUNION", "CREDIT REPORT"]):
-            return False
-
-        return True
-
-    # Find block starts
-    starts = [i for i, ln in enumerate(lines) if looks_like_creditor_line(ln)]
-    if not starts:
-        return []
-
-    blocks = []
-    for idx, s in enumerate(starts):
-        e = starts[idx + 1] if idx + 1 < len(starts) else len(lines)
-        block = "\n".join([ln.strip() for ln in lines[s:e]]).strip()
-        if len(block) >= 50:
-            blocks.append(block)
+    units = []
+    for chunk in splits:
+        c = chunk.strip()
+        if len(c) < 40:
+            continue
+        # Cut off bureau footer noise if it leaks in
+        cut_markers = ["BIRCHWOOD CREDIT SERVICES", "Page ", "FILE #", "DATE COMPLETED", "SEND TO"]
+        for mk in cut_markers:
+            idx = c.upper().find(mk.upper())
+            if idx != -1 and idx < 800:  # if footer begins early, trim there
+                c = c[:idx].strip()
+        if len(c) >= 40:
+            units.append(c)
 
     tradelines: List[Tradeline] = []
 
-    for b in blocks:
-        b_norm = normalize_spaces(b)
-        b_up = b_norm.upper()
+    # Helper patterns
+    money_pat = re.compile(r"\$[\d,]+")
+    date_pat = re.compile(r"\b\d{2}/\d{2,4}\b")
+    acct_digits_pat = re.compile(r"\b\d{8,}\b")
 
-        # Creditor is first line of original block (safer than regex)
-        first_line = b.splitlines()[0].strip()
-        creditor = normalize_spaces(first_line)
+    def pick_table_row(lines: List[str]) -> str:
+        # row usually has 2 dates + at least one money token
+        for ln in lines[:8]:
+            if len(date_pat.findall(ln)) >= 2 and money_pat.search(ln):
+                return ln
+        # fallback: any line with a money token
+        for ln in lines[:10]:
+            if money_pat.search(ln):
+                return ln
+        return ""
 
-        # Account number: look for "ACCOUNT" or patterns like "ACCT" or "ACCOUNT #"
-        acct = ""
-        m = re.search(r"\b(ACCOUNT|ACCT)\s*(#|NUMBER|NO\.?)?\s*[:\-]?\s*([A-Z0-9\*\-]{4,30})\b", b_up)
-        if m:
-            acct = m.group(3)
-        else:
-            # Some reports show account number immediately under creditor line
-            # Try second line if it contains digits/asterisks
-            blines = [normalize_spaces(x) for x in b.splitlines() if x.strip()]
-            if len(blines) >= 2:
-                if re.search(r"[\d\*]{4,}", blines[1]):
-                    acct = blines[1]
+    def creditor_before_first_date(ln: str) -> str:
+        # grab text before first date token
+        m = re.search(r"^(.*?)(\b\d{2}/\d{2,4}\b)", ln)
+        if not m:
+            return ""
+        name = normalize_spaces(m.group(1))
+        # prevent grabbing empty/garbage
+        if len(name) < 2:
+            return ""
+        return name
 
-        acct_masked = mask_account_number(acct)
+    def looks_like_creditor_continuation(ln: str) -> bool:
+        # For cases like "AUTO FINAN 1/26 12/25" or "CENTURY BAN"
+        s = normalize_spaces(ln)
+        if not s or len(s) > 35:
+            return False
+        # Not a label line
+        if any(x in s.upper() for x in ["DLA", "ECOA", "SOURCE", "BALANCE", "PAST DUE", "PAYMENT", "OPENED", "REPORTED"]):
+            return False
+        # Must have letters
+        if not re.search(r"[A-Z]", s.upper()):
+            return False
+        return True
 
-        # Dates: Opened / Reported / Charge-off / Last late
+    for unit in units:
+        raw_lines = [ln.strip() for ln in unit.splitlines() if ln.strip()]
+        if not raw_lines:
+            continue
+
+        table_row = pick_table_row(raw_lines)
         opened_date = ""
         last_reported = ""
-        chargeoff_date = ""
-        last_late_date = ""
+        balance = None
 
-        # These labels vary; we try a few
-        def find_date_after(label_pat: str) -> str:
-            m = re.search(label_pat + r"\s*[:\-]?\s*([^\|]{0,30})", b_up)
-            if not m:
-                return ""
-            return extract_first_date(m.group(1))
+        if table_row:
+            dates = date_pat.findall(table_row)
+            if len(dates) >= 2:
+                opened_date = dates[0]
+                last_reported = dates[1]
 
-        opened_date = find_date_after(r"\bOPENED\b")
-        last_reported = find_date_after(r"\b(REPORTED|LAST REPORTED)\b")
-        chargeoff_date = find_date_after(r"\b(CHARGE\s*OFF|CHARGED\s*OFF)\b")
-        last_late_date = find_date_after(r"\b(LAST\s+LATE\s+DATE|LAST\s+LATE)\b")
+            monies = money_pat.findall(table_row)
+            if monies:
+                # In your PDF, the last $ amount on the row is typically the balance
+                balance = parse_money(monies[-1])
 
-        # Money fields
-        bal = None
-        m = re.search(r"\bBALANCE\b\s*\$?\s*([\d,]+)", b_up)
-        if m:
-            bal = parse_money(m.group(1))
+        # Find creditor name
+        creditor = ""
 
-        lim = None
-        m = re.search(r"\bCREDIT\s*LIMIT\b\s*\$?\s*([\d,]+)", b_up)
-        if m:
-            lim = parse_money(m.group(1))
+        # Case A: first line has creditor + dates
+        c = creditor_before_first_date(raw_lines[0])
+        if c:
+            creditor = c
 
-        past_due = None
-        m = re.search(r"\bPAST\s*DUE\b\s*\$?\s*([\d,]+)", b_up)
-        if m:
-            past_due = parse_money(m.group(1))
+            # Possible second line continuation (e.g., "AUTO FINAN 1/26 12/25" or "CENTURY BAN")
+            if len(raw_lines) >= 2 and looks_like_creditor_continuation(raw_lines[1]):
+                cont = creditor_before_first_date(raw_lines[1]) or normalize_spaces(raw_lines[1])
+                # avoid appending if it is actually an account number line
+                if not acct_digits_pat.search(cont):
+                    creditor = normalize_spaces(f"{creditor} {cont}")
 
-        # Type detection
+        # Case B: first line starts with dates (no creditor); look later
+        if not creditor:
+            for ln in raw_lines[:12]:
+                # a later creditor line often looks like "CPS/MAIL 06/23 ... CHARGE OFF 6/23"
+                c2 = creditor_before_first_date(ln)
+                if c2:
+                    creditor = c2
+                    break
+            if not creditor:
+                # fallback: pick first non-label text line with letters
+                for ln in raw_lines[:12]:
+                    s = normalize_spaces(ln)
+                    if re.search(r"[A-Z]", s.upper()) and not any(x in s.upper() for x in ["DLA", "ECOA", "SOURCE", "OPENED", "REPORTED"]):
+                        creditor = s[:35]
+                        break
+
+        creditor = creditor or "Unknown"
+
+        # Account number: first long digit token in unit
+        acct_raw = ""
+        for ln in raw_lines:
+            m = acct_digits_pat.search(ln)
+            if m:
+                acct_raw = m.group(0)
+                break
+        acct_masked = mask_account_number(acct_raw)
+
+        # Account type
+        unit_up = " ".join(raw_lines).upper()
         acct_type = "Unknown"
         for t in ["AUTO", "INSTALLMENT", "REVOLVING", "COLLECTION", "OPEN", "OTHER"]:
-            if re.search(rf"\b{t}\b", b_up):
+            if re.search(rf"\b{t}\b", unit_up):
                 acct_type = t.title()
                 break
 
-        # Status inference (expanded)
+        # Past due (if present as $xxxx somewhere)
+        past_due = None
+        m = re.search(r"\bPAST DUE\b\s*\$?\s*([\d,]+)", unit_up)
+        if m:
+            past_due = parse_money(m.group(1))
+
+        # Credit limit
+        limit = None
+        m = re.search(r"\bCREDIT LIMIT\b\s*\$?\s*([\d,]+)", unit_up)
+        if m:
+            limit = parse_money(m.group(1))
+
+        # Charge-off date
+        chargeoff_date = ""
+        m = re.search(r"\bCHARGE\s*OFF\b\s*(\d{2}/\d{2,4})\b", unit_up)
+        if not m:
+            m = re.search(r"\bCHARGED\s*OFF\b\s*(\d{2}/\d{2,4})\b", unit_up)
+        if m:
+            chargeoff_date = m.group(1)
+
+        # Last late date (if present)
+        last_late_date = ""
+        m = re.search(r"\bLAST\s+LATE\s+DATE\b\s*(\d{2}/\d{2,4})\b", unit_up)
+        if m:
+            last_late_date = m.group(1)
+
+        # Status
         status = "Unknown"
-        if "CHARGE OFF" in b_up or "CHARGED OFF" in b_up or "CHARGEOFF" in b_up:
+        if "CHARGE OFF" in unit_up or "CHARGED OFF" in unit_up or "CHARGEOFF" in unit_up:
             status = "Charge Off"
-        elif "COLLECTION" in b_up:
+        elif "COLLECTION" in unit_up:
             status = "Collection"
-        elif "PAST DUE" in b_up or (past_due or 0) > 0:
+        elif (past_due or 0) > 0 or "PAST DUE" in unit_up or "DELINQUENT" in unit_up:
             status = "Past Due / Delinquent"
-        elif "CUR WAS" in b_up:
+        elif "CUR WAS" in unit_up:
             status = "Current (prior delinquency: CUR WAS)"
-        elif "PD WAS" in b_up:
+        elif "PD WAS" in unit_up:
             status = "Current (prior delinquency: PD WAS)"
-        elif "AS AGREED" in b_up or "PAID" in b_up:
+        elif "AS AGREED" in unit_up or "PAID" in unit_up:
             status = "As Agreed / Paid"
 
-        # Remarks (pull key phrases)
+        # Remarks (key phrases)
         remarks = []
-        notable_phrases = [
+        for ph in [
             "ACCOUNT INFORMATION DISPUTED BY CONSUMER",
             "PROFIT AND LOSS WRITEOFF",
             "CHARGED OFF ACCOUNT",
             "COLLECTION ACCOUNT",
-            "CLOSED",
             "AUTHORIZED USER",
-        ]
-        for ph in notable_phrases:
-            if ph in b_up:
+            "CLOSED",
+        ]:
+            if ph in unit_up:
                 remarks.append(ph.title())
 
         tradelines.append(
@@ -277,8 +313,8 @@ def extract_tradelines_from_report(text: str) -> List[Tradeline]:
                 last_reported_date=last_reported,
                 chargeoff_date=chargeoff_date,
                 last_late_date=last_late_date,
-                balance=bal,
-                limit=lim,
+                balance=balance,
+                limit=limit,
                 past_due=past_due,
                 remarks="; ".join(remarks),
             )
@@ -288,15 +324,7 @@ def extract_tradelines_from_report(text: str) -> List[Tradeline]:
     seen = set()
     uniq = []
     for t in tradelines:
-        key = (
-            t.creditor.lower().strip(),
-            t.account_number.strip(),
-            (t.status or "").lower().strip(),
-            t.balance,
-            t.limit,
-            t.past_due,
-            t.last_reported_date,
-        )
+        key = (t.creditor.lower().strip(), t.account_number, t.opened_date, t.last_reported_date, t.balance, t.status)
         if key in seen:
             continue
         seen.add(key)
@@ -312,11 +340,7 @@ def is_negative_tradeline(t: Tradeline) -> bool:
     s = (t.status or "").upper()
     r = (t.remarks or "").upper()
     pd = (t.past_due or 0) > 0
-
-    markers = [
-        "CHARGE OFF", "COLLECTION", "DELINQUENT", "DELINQUENCY", "PAST DUE",
-        "CUR WAS", "PD WAS", "WRITEOFF", "WRITE OFF", "CHARGED OFF"
-    ]
+    markers = ["CHARGE OFF", "COLLECTION", "DELINQUENT", "PAST DUE", "CUR WAS", "PD WAS", "WRITEOFF", "CHARGED OFF"]
     return pd or any(m in s for m in markers) or any(m in r for m in markers)
 
 
@@ -358,7 +382,6 @@ def estimate_overall_utilization(tradelines: List[Tradeline]) -> Optional[float]
 def generate_recommendations(tradelines: List[Tradeline]) -> List[Recommendation]:
     recs: List[Recommendation] = []
 
-    # Global utilization
     util = estimate_overall_utilization(tradelines)
     if util is not None:
         current_pts = utilization_points(util)
@@ -378,20 +401,19 @@ def generate_recommendations(tradelines: List[Tradeline]) -> List[Recommendation
                     )
                 )
 
-    # Per negative tradeline
     for t in tradelines:
         if not is_negative_tradeline(t):
             continue
 
         s = (t.status or "").upper()
         pd_amt = t.past_due or 0
+        label = f"{t.creditor} ({t.account_number})".strip()
 
-        # Past due
         if pd_amt > 0 or "PAST DUE" in s or "DELINQUENT" in s:
             recs.append(
                 Recommendation(
                     action="Bring account current (pay past-due / establish repayment) and keep current",
-                    target=f"{t.creditor} ({t.account_number})".strip(),
+                    target=label,
                     estimated_points_low=15,
                     estimated_points_high=45,
                     why="Active delinquency is a strong mortgage risk factor. Getting current can help once it updates.",
@@ -399,12 +421,11 @@ def generate_recommendations(tradelines: List[Tradeline]) -> List[Recommendation
                 )
             )
 
-        # Collection
         if "COLLECTION" in s:
             recs.append(
                 Recommendation(
                     action="Attempt Pay-For-Delete (best); if not possible, settle and verify update to paid/$0",
-                    target=f"{t.creditor} ({t.account_number})".strip(),
+                    target=label,
                     estimated_points_low=5,
                     estimated_points_high=25,
                     why="Deletion usually helps more than ‘paid’, but impact varies. Ensure reporting updates and avoid dispute remarks during underwriting.",
@@ -412,12 +433,11 @@ def generate_recommendations(tradelines: List[Tradeline]) -> List[Recommendation
                 )
             )
 
-        # Charge-off
         if "CHARGE OFF" in s:
             recs.append(
                 Recommendation(
                     action="Negotiate delete/removal of derogatory remarks; otherwise settle and ensure balance updates to $0",
-                    target=f"{t.creditor} ({t.account_number})".strip(),
+                    target=label,
                     estimated_points_low=3,
                     estimated_points_high=18,
                     why="Charge-offs can remain; best-case is deletion. Balance-to-$0 and remark cleanup can help modestly and supports underwriting.",
@@ -425,12 +445,11 @@ def generate_recommendations(tradelines: List[Tradeline]) -> List[Recommendation
                 )
             )
 
-        # Prior delinquency markers
         if "CUR WAS" in s or "PD WAS" in s:
             recs.append(
                 Recommendation(
                     action="If accurate, no quick delete: focus on perfect payments + reduce utilization + resolve active derogatories first",
-                    target=f"{t.creditor} ({t.account_number})".strip(),
+                    target=label,
                     estimated_points_low=0,
                     estimated_points_high=12,
                     why="Accurate lates are hard to remove quickly. Short-term gains usually come from utilization and resolving active derogatories.",
@@ -438,10 +457,8 @@ def generate_recommendations(tradelines: List[Tradeline]) -> List[Recommendation
                 )
             )
 
-    # Rank
     recs.sort(key=lambda x: (x.estimated_points_high, x.estimated_points_low), reverse=True)
 
-    # De-dupe
     seen = set()
     out = []
     for r in recs:
@@ -474,9 +491,8 @@ st.set_page_config(page_title="Mortgage Credit Simulator (Conservative)", layout
 st.title("Mortgage Credit Simulator (Conservative, Non-FICO)")
 
 st.caption(
-    "Upload a mortgage-style credit report PDF. The app extracts tradelines (best-effort), "
-    "lists negative accounts with key fields (account #, last reported, etc.), "
-    "and generates a ranked action plan + 30/60/90 projections."
+    "Upload a mortgage-style credit report PDF. The app extracts tradelines (tuned to this report style), "
+    "lists negative accounts with account #, dates, and balances, and generates a ranked action plan."
 )
 
 left, right = st.columns([2, 1], gap="large")
@@ -491,8 +507,8 @@ with right:
     )
     st.divider()
     st.markdown("### Notes")
-    st.write("- This is a conservative simulator, not an official FICO model.")
-    st.write("- Text-based PDFs work best. Scanned PDFs may require OCR (optional).")
+    st.write("- Conservative simulator, not official FICO.")
+    st.write("- Text-based PDFs work best.")
 
 with left:
     pdf = st.file_uploader("Upload credit report PDF", type=["pdf"])
@@ -513,18 +529,14 @@ with left:
         tradelines = extract_tradelines_from_report(text)
 
     if not tradelines:
-        st.error("No tradelines detected. If this report format differs, we can tune the parser.")
+        st.error("No tradelines detected. If the report template differs, we can tune further.")
         st.stop()
 
     negative_lines = [t for t in tradelines if is_negative_tradeline(t)]
 
     st.subheader("Negative accounts detected")
     st.write(f"Total tradelines parsed: **{len(tradelines)}** | Negative tradelines: **{len(negative_lines)}**")
-
-    if negative_lines:
-        st.dataframe([asdict(t) for t in negative_lines], use_container_width=True)
-    else:
-        st.info("No negative tradelines detected by current rules.")
+    st.dataframe([asdict(t) for t in negative_lines], use_container_width=True)
 
     recs = generate_recommendations(tradelines)
 
@@ -554,3 +566,6 @@ with left:
                 f"(~{r.timeline_days} days)\n"
                 f"  - Why: {r.why}"
             )
+
+    with st.expander("Debug: show all parsed tradelines"):
+        st.dataframe([asdict(t) for t in tradelines], use_container_width=True)
