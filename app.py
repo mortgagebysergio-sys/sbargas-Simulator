@@ -360,7 +360,7 @@ def tradelines_to_df(lines: List[Tradeline]) -> pd.DataFrame:
     return df
 
 
-def df_to_tradelines(obj) -> List[Tradeline]:
+def if isinstance(working_df, list):     working_df = pd.DataFrame(working_df)(obj) -> List[Tradeline]:
     """
     Accepts either:
       - pandas DataFrame (preferred)
@@ -1133,13 +1133,13 @@ if PII_MASK:
 # ----------------------------
 # Top Metrics
 # ----------------------------
-neg_counts = summarize_negatives(df_to_tradelines(working_df.fillna("").to_dict(orient="records") if isinstance(working_df, pd.DataFrame) else []))
+neg_counts = summarize_negatives(if isinstance(working_df, list):     working_df = pd.DataFrame(working_df)(working_df.fillna("").to_dict(orient="records") if isinstance(working_df, pd.DataFrame) else []))
 # Better: compute from df directly
 collections_ct = int((working_df["status"] == "collection").sum()) if "status" in working_df.columns else 0
 chargeoffs_ct = int((working_df["status"] == "charge_off").sum()) if "status" in working_df.columns else 0
 lates_ct = int((working_df["status"] == "late").sum()) if "status" in working_df.columns else 0
 
-score_lo, score_hi, score_info = baseline_score_range(df_to_tradelines(working_df.assign(balance=working_df.get("balance", "")).fillna("").to_dict(orient="records")), user_score_val)
+score_lo, score_hi, score_info = baseline_score_range(if isinstance(working_df, list):     working_df = pd.DataFrame(working_df)(working_df.assign(balance=working_df.get("balance", "")).fillna("").to_dict(orient="records")), user_score_val)
 
 # Utilization (optional)
 def coerce_float(x):
