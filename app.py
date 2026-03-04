@@ -1,1295 +1,508 @@
-import io
-import re
-import math
-from dataclasses import dataclass
-from datetime import datetime, date
-from typing import List, Tuple, Optional, Dict
+# app.py
+# Birchwood Credit Report Analyzer (Streamlit)
+# - Upload Birchwood PDF
+# - Extract negative accounts (collections/charge-offs/serious lates)
+# - Generate ranked repair plan + Word doc
 
-import pandas as pd
+import re
+import io
+import tempfile
+from dataclasses import dataclass, asdict
+from typing import List, Optional, Tuple, Dict
+
 import streamlit as st
 
+# PDF extraction
 import fitz  # PyMuPDF
+
+# OCR fallback
 from PIL import Image
 import pytesseract
 
-from reportlab.lib.pagesizes import letter
-from reportlab.lib.units import inch
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-from reportlab.lib import colors
-from reportlab.lib.styles import getSampleStyleSheet
+# Word doc output
+from docx import Document
 
 
-# =============================
-# App Config
-# =============================
-st.set_page_config(page_title="Birchwood Negative Accounts Extractor", page_icon="📄", layout="wide")
-TODAY = date.today()
-
-# =============================
-# PII masking helpers
-# =============================
-ACCT_LIKE_RE = re.compile(r"(?<!\d)(?:X{2,}|\*{2,}|\d)[Xx\*\-\s\d]{5,}(?!\d)")
-DIGIT_RUN_RE = re.compile(r"(?<!\d)(\d[\d\-\s]{6,}\d)(?!\d)")
-
-
-def mask_account_number(raw: str) -> str:
-    """
-    Birchwood can use numeric account IDs in left column.
-    We never expose full. We only show last 4 digits when digits exist.
-    """
-    if not raw:
-        return ""
-    digits = re.sub(r"\D", "", raw)
-    if len(digits) >= 4:
-        return f"••••{digits[-4:]}"
-    return "••••"
+# ----------------------------
+# Models
+# ----------------------------
+@dataclass
+class NegativeAccount:
+    creditor: str
+    account_number: str
+    acct_type: str  # "COLLECTION" | "CHARGE OFF" | "SERIOUS DELINQUENCY"
+    balance: Optional[str] = None
+    past_due: Optional[str] = None
+    last_reported: Optional[str] = None
+    opened: Optional[str] = None
+    dla: Optional[str] = None
+    original_creditor: Optional[str] = None
+    source_bureaus: Optional[str] = None
+    notes: Optional[str] = None
+    contact_phone: Optional[str] = None
+    contact_address: Optional[str] = None
+    strategy: Optional[str] = None
+    priority_rank: Optional[int] = None
 
 
-def mask_pii_in_snippet(text: str) -> str:
-    if not text:
-        return ""
+# ----------------------------
+# Utilities
+# ----------------------------
+def normalize_spaces(s: str) -> str:
+    return re.sub(r"[ \t]+", " ", s).strip()
 
-    def repl(m):
-        token = m.group(0)
-        digits = re.sub(r"\D", "", token)
-        if len(digits) >= 4:
-            return f"••••{digits[-4:]}"
-        return "••••"
-
-    text = ACCT_LIKE_RE.sub(repl, text)
-    text = DIGIT_RUN_RE.sub(repl, text)
-    return text
-
-
-# =============================
-# Date + Money helpers
-# =============================
-def parse_mm_yy(s: str) -> Optional[date]:
-    s = (s or "").strip()
-    m = re.search(r"\b(0?[1-9]|1[0-2])[/\-]((?:\d{2})|(?:19|20)\d{2})\b", s)
+def money_to_float(m: str) -> Optional[float]:
     if not m:
         return None
-    mm = int(m.group(1))
-    yy = m.group(2)
-    yyyy = int("20" + yy) if len(yy) == 2 else int(yy)
+    m = m.replace(",", "").replace("$", "").strip()
     try:
-        return date(yyyy, mm, 1)
-    except ValueError:
+        return float(m)
+    except:
         return None
 
+def safe_text(s: Optional[str]) -> str:
+    return s if s else ""
 
-def format_date(d: Optional[date]) -> str:
-    return d.strftime("%Y-%m-%d") if d else ""
+def looks_like_birchwood(text: str) -> bool:
+    t = text.lower()
+    return ("birchwood" in t and "merged infile credit report" in t) or ("birchwood credit services" in t)
 
-
-def calc_age(opened: Optional[date]) -> str:
-    if not opened:
-        return ""
-    months = (TODAY.year - opened.year) * 12 + (TODAY.month - opened.month)
-    if months < 0:
-        return ""
-    years = months // 12
-    rem = months % 12
-    if years <= 0:
-        return f"{rem} mo"
-    if rem == 0:
-        return f"{years} yr"
-    return f"{years} yr {rem} mo"
-
-
-MONEY_RE = re.compile(r"(?i)\$?\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2})?|[0-9]+(?:\.[0-9]{2})?)")
-
-
-def parse_money(text: str) -> Optional[float]:
-    if not text:
-        return None
-    m = MONEY_RE.search(text.replace("O", "0"))
-    if not m:
-        return None
-    val = m.group(1).replace(",", "")
-    try:
-        return float(val)
-    except ValueError:
-        return None
-
-
-def format_money(x: Optional[float]) -> str:
-    if x is None or (isinstance(x, float) and math.isnan(x)):
-        return ""
-    try:
-        return "${:,.2f}".format(float(x))
-    except Exception:
-        return ""
-
-
-# =============================
-# Extraction pipeline
-# =============================
-def extract_text_pymupdf(pdf_bytes: bytes) -> str:
+def extract_text_pymupdf(pdf_bytes: bytes) -> Tuple[str, List[str]]:
+    """Return full text and per-page text."""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    parts = []
-    for page in doc:
-        parts.append(page.get_text("text") or "")
-    doc.close()
-    return "\n".join(parts).strip()
+    pages = []
+    for i in range(doc.page_count):
+        pages.append(doc.load_page(i).get_text("text") or "")
+    full = "\n\n".join(pages)
+    return full, pages
 
-
-def extract_text_ocr(pdf_bytes: bytes, dpi: int = 220) -> str:
+def ocr_pdf_pages(pdf_bytes: bytes, max_pages: int = 12, dpi: int = 200) -> Tuple[str, List[str]]:
+    """OCR pages to text (fallback for image-based PDFs)."""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    parts = []
-    zoom = dpi / 72.0
-    mat = fitz.Matrix(zoom, zoom)
-    for page in doc:
+    n = min(doc.page_count, max_pages)
+    page_texts: List[str] = []
+    for i in range(n):
+        page = doc.load_page(i)
+        mat = fitz.Matrix(dpi / 72.0, dpi / 72.0)
         pix = page.get_pixmap(matrix=mat, alpha=False)
         img = Image.open(io.BytesIO(pix.tobytes("png")))
         txt = pytesseract.image_to_string(img)
-        parts.append(txt or "")
-    doc.close()
-    return "\n".join(parts).strip()
+        page_texts.append(txt or "")
+    full = "\n\n".join(page_texts)
+    return full, page_texts
+
+def choose_best_text(primary_full: str, primary_pages: List[str],
+                     ocr_full: str, ocr_pages: List[str]) -> Tuple[str, List[str], str]:
+    """Pick the best extraction result based on heuristics."""
+    # Score: length + presence of key tokens
+    def score(t: str) -> int:
+        tl = t.lower()
+        s = len(t)
+        for k in ["tradelines", "collections", "charge off", "derogatory summary", "creditors"]:
+            if k in tl:
+                s += 2000
+        if looks_like_birchwood(t):
+            s += 5000
+        return s
+
+    p_score = score(primary_full)
+    o_score = score(ocr_full)
+
+    if o_score > p_score * 1.1 and len(ocr_full.strip()) > 500:
+        return ocr_full, ocr_pages, "OCR"
+    return primary_full, primary_pages, "TEXT"
 
 
-# =============================
-# Models
-# =============================
-@dataclass
-class ParseNote:
-    block_index: int
-    notes: List[str]
-
-
-@dataclass
-class NegativeAccount:
-    creditor_name: str = ""
-    masked_account_number: str = ""
-    current_balance: Optional[float] = None
-    last_reported_date: Optional[date] = None
-    date_opened: Optional[date] = None
-    age_of_account: str = ""
-    negative_type_status: str = ""
-    bureaus: str = ""
-    estimated_impact: str = ""
-    raw_block_snippet: str = ""
-
-
-# =============================
-# Birchwood negative detection (status)
-# =============================
-def birchwood_negative_status(text: str) -> Tuple[bool, str]:
-    t = (text or "").upper()
-
-    if "CHARGE OFF" in t or "CHARGED OFF" in t:
-        return True, "Charge-off"
-    if re.search(r"\bCOLLECTION\b", t):
-        return True, "Collection"
-
-    m = re.search(r"\bDELINQ\s*(30|60|90|120)\b", t)
-    if m:
-        n = m.group(1)
-        if n == "120":
-            return True, "Late (120+)"
-        return True, f"Late ({n})"
-
-    # bucket counts sometimes appear (30-59 / 60-89 / 90+)
-    # If any of these columns show a non-zero count, treat as a late.
-    # (We keep it simple: 90+ > 60-89 > 30-59.)
-    def count_bucket(label: str) -> int:
-        m2 = re.search(rf"(?i){re.escape(label)}\s*[:\s]*\b(\d+)\b", text)
-        return int(m2.group(1)) if m2 else 0
-
-    c90 = count_bucket("90+")
-    c60 = count_bucket("60-89")
-    c30 = count_bucket("30-59")
-
-    if c90 > 0:
-        return True, "Late (90)"
-    if c60 > 0:
-        return True, "Late (60)"
-    if c30 > 0:
-        return True, "Late (30)"
-
-    if "BANKRUPT" in t or "CHAPTER 7" in t or "CHAPTER 13" in t:
-        return True, "Bankruptcy"
-    if "FORECLOS" in t:
-        return True, "Foreclosure"
-    if "REPOS" in t:
-        return True, "Repossession"
-    if "JUDG" in t:
-        return True, "Judgment"
-
-    return False, ""
-
-
-def detect_bureaus_from_text(text: str) -> str:
-    t = (text or "").upper()
-    found = []
-    if "XP" in t or "EX" in t:
-        found.append("Experian")
-    if "TU" in t:
-        found.append("TransUnion")
-    if "EF" in t or "EQ" in t:
-        found.append("Equifax")
-    found = list(dict.fromkeys(found))
-    if not found:
-        return "Unknown"
-    if len(found) == 1:
-        return found[0]
-    return "/".join(found)
-
-
-# =============================
-# Impact estimator (heuristics)
-# =============================
-def impact_range_for_account(neg_type: str, last_reported: Optional[date], balance: Optional[float]) -> Tuple[str, str]:
-    t = (neg_type or "").lower()
-    bal = balance or 0.0
-
-    recency = "unknown"
-    if last_reported:
-        months = (TODAY.year - last_reported.year) * 12 + (TODAY.month - last_reported.month)
-        if months <= 12:
-            recency = "recent"
-        elif months <= 24:
-            recency = "mid"
-        else:
-            recency = "old"
-
-    if bal >= 10000:
-        bsev = "high"
-    elif bal >= 2000:
-        bsev = "med"
-    else:
-        bsev = "low"
-
-    if "bankruptcy" in t:
-        base, tier = (60, 180), "Severe"
-    elif "foreclosure" in t:
-        base, tier = (50, 160), "Severe"
-    elif "judgment" in t:
-        base, tier = (35, 110), "High"
-    elif "repossession" in t:
-        base, tier = (40, 120), "High"
-    elif "charge-off" in t:
-        base, tier = (25, 90), "High"
-    elif "collection" in t:
-        base, tier = (15, 70), "Moderate"
-    elif "late (120" in t:
-        base, tier = (20, 80), "High"
-    elif "late (90" in t:
-        base, tier = (18, 70), "Moderate"
-    elif "late (60" in t:
-        base, tier = (12, 45), "Moderate"
-    elif "late (30" in t:
-        base, tier = (5, 25), "Low"
-    else:
-        base, tier = (8, 35), "Low–Moderate"
-
-    lo, hi = base
-
-    if recency == "recent":
-        lo, hi = int(lo * 1.15), int(hi * 1.20)
-    elif recency == "old":
-        lo, hi = int(lo * 0.70), int(hi * 0.75)
-    else:
-        lo, hi = int(lo * 0.90), int(hi * 0.90)
-
-    if any(x in t for x in ["collection", "charge-off", "repossession", "judgment"]):
-        if bsev == "high":
-            lo, hi = int(lo * 1.15), int(hi * 1.20)
-        elif bsev == "med":
-            lo, hi = int(lo * 1.05), int(hi * 1.08)
-        else:
-            lo, hi = int(lo * 0.95), int(hi * 0.95)
-
-    lo = max(0, lo)
-    hi = max(lo + 5, hi)
-    return tier, f"{lo}–{hi} pts"
-
-
-def overall_negative_pressure(accounts: List[NegativeAccount]) -> str:
-    if not accounts:
-        return "None detected"
-    w = 0.0
-    for a in accounts:
-        t = (a.negative_type_status or "").lower()
-        if "bankruptcy" in t or "foreclosure" in t:
-            w += 3.5
-        elif "repossession" in t or "judgment" in t:
-            w += 2.8
-        elif "charge-off" in t:
-            w += 2.3
-        elif "collection" in t:
-            w += 1.6
-        elif "late (120" in t:
-            w += 1.9
-        elif "late (90" in t:
-            w += 1.5
-        elif "late (60" in t:
-            w += 1.1
-        elif "late (30" in t:
-            w += 0.7
-        else:
-            w += 0.6
-
-        bal = a.current_balance or 0.0
-        if bal >= 10000:
-            w += 0.5
-        elif bal >= 2000:
-            w += 0.2
-
-        if a.last_reported_date:
-            months = (TODAY.year - a.last_reported_date.year) * 12 + (TODAY.month - a.last_reported_date.month)
-            if months <= 12:
-                w += 0.4
-            elif months <= 24:
-                w += 0.2
-
-    if w >= 12:
-        return "Very High negative pressure"
-    if w >= 7:
-        return "High negative pressure"
-    if w >= 3.5:
-        return "Moderate negative pressure"
-    return "Low negative pressure"
-
-
-# =============================
-# Confidence
-# =============================
-def compute_confidence(extracted_text: str, accounts: List[NegativeAccount]) -> Tuple[str, Dict[str, float]]:
-    tlen = len((extracted_text or "").strip())
-    n = max(1, len(accounts))
-
-    def filled(v) -> bool:
-        if v is None:
-            return False
-        if isinstance(v, str):
-            return bool(v.strip())
-        return True
-
-    key_fields = ["creditor_name", "masked_account_number", "current_balance", "negative_type_status", "last_reported_date"]
-    completion = 0.0
-    for k in key_fields:
-        completion += sum(1 for a in accounts if filled(getattr(a, k))) / n
-    completion /= len(key_fields)
-
-    if tlen >= 12000:
-        len_score = 1.0
-    elif tlen >= 5000:
-        len_score = 0.7
-    elif tlen >= 2000:
-        len_score = 0.45
-    else:
-        len_score = 0.25
-
-    score = 0.55 * completion + 0.45 * len_score
-    if score >= 0.78:
-        label = "High"
-    elif score >= 0.55:
-        label = "Medium"
-    else:
-        label = "Low"
-
-    return label, {"text_length": float(tlen), "completion_rate": float(completion), "score": float(score)}
-
-
-# =============================
-# Birchwood TRADELINES (coordinate-aware parser)
-# =============================
-TRADELINES_MARKER = "TRADELINES"
-TRADE_SUMMARY_MARKER = "TRADE SUMMARY"
-
-# Column headers we expect in Birchwood
-HEADER_TOKENS = [
-    "Opened", "Reported", "Hi. Credit", "Credit Limit", "Reviewed",
-    "30-59", "60-89", "90+", "Past Due", "Payment", "Balance"
-]
-
-# For filtering junk rows as "creditor"
-CREDITOR_BAD_PREFIXES = (
-    "Opened", "Reported", "Hi.", "Hi. Credit", "Credit", "Credit Limit",
-    "Reviewed", "30-59", "60-89", "90+", "Past Due", "Payment", "Balance",
-    "Source", "ECOA", "CUR", "WAS"
-)
-
-
-def _flatten_page_lines(page: fitz.Page) -> List[Dict]:
+# ----------------------------
+# Parsing Birchwood structures
+# ----------------------------
+def parse_creditors_directory(full_text: str) -> Dict[str, Dict[str, str]]:
     """
-    Returns list of line items: {text, x0,x1,y0,y1, cx, cy}
+    Parse the CREDITORS directory section:
+    Lines often like:
+      "PORTFOLIO RECOVERY A 120 CORPORATE BLVD... 888-772-7326"
+    We'll map by a normalized creditor key to phone/address when we can.
     """
-    d = page.get_text("dict")
-    out = []
-    for b in d.get("blocks", []):
-        for ln in b.get("lines", []):
-            # line text from spans
-            spans = ln.get("spans", [])
-            if not spans:
-                continue
-            text = "".join(s.get("text", "") for s in spans).strip()
-            if not text:
-                continue
-            x0, y0, x1, y1 = ln.get("bbox", [0, 0, 0, 0])
-            out.append({
-                "text": re.sub(r"\s+", " ", text).strip(),
-                "x0": float(x0), "x1": float(x1), "y0": float(y0), "y1": float(y1),
-                "cx": float((x0 + x1) / 2.0),
-                "cy": float((y0 + y1) / 2.0),
-            })
-    out.sort(key=lambda r: (r["y0"], r["x0"]))
-    return out
+    directory: Dict[str, Dict[str, str]] = {}
+    t = full_text
 
+    # Try to isolate CREDITORS section
+    m = re.search(r"\nCREDITORS\s*\n(.+?)(\n{2,}|\Z)", t, flags=re.IGNORECASE | re.DOTALL)
+    if not m:
+        # Some reports keep it across pages; be more permissive
+        m = re.search(r"CREDITORS\s*\n(.+)", t, flags=re.IGNORECASE | re.DOTALL)
+    if not m:
+        return directory
 
-def _find_tradelines_y_range(lines: List[Dict]) -> Optional[Tuple[float, float]]:
-    """
-    Find approximate y-range of TRADELINES section on the page using text markers.
-    """
-    y_start = None
-    y_end = None
-    for r in lines:
-        t = r["text"].upper()
-        if TRADELINES_MARKER in t and y_start is None:
-            y_start = r["y0"]
-        if (TRADE_SUMMARY_MARKER in t or "TRADE SUMMARY" in t) and y_start is not None:
-            y_end = r["y0"]
+    blob = m.group(1)
+    lines = [normalize_spaces(x) for x in blob.splitlines() if normalize_spaces(x)]
+    # Stop if we hit something clearly not directory
+    stop_tokens = {"miscellaneous", "end of report", "www.", "experian", "transunion", "equifax"}
+    cleaned = []
+    for line in lines:
+        low = line.lower()
+        if any(tok in low for tok in stop_tokens):
             break
-    if y_start is None:
-        return None
-    if y_end is None:
-        y_end = max(r["y1"] for r in lines) if lines else y_start + 2000
-    # add buffers
-    return (y_start + 5.0, y_end - 5.0)
+        cleaned.append(line)
 
+    # Heuristic parse: creditor name then address then phone at end
+    for line in cleaned:
+        # Look for phone at end
+        phone = None
+        phone_m = re.search(r"(\(?\d{3}\)?[-.\s]\d{3}[-.\s]\d{4}|\d{3}[-.\s]\d{3}[-.\s]\d{4})\s*$", line)
+        if phone_m:
+            phone = phone_m.group(1).replace(".", "-").replace(" ", "-")
+            pre = line[:phone_m.start()].strip()
+        else:
+            pre = line.strip()
 
-def _detect_header_columns(lines: List[Dict], y0: float, y1: float) -> Dict[str, float]:
+        # Split pre into name + address guess
+        # Name is leading chunk until we see a digit (street number) or PO BOX
+        name = pre
+        addr = ""
+        street_m = re.search(r"\b(PO BOX|P O BOX|BOX|\d{1,6}\s)\b", pre, flags=re.IGNORECASE)
+        if street_m:
+            name = pre[:street_m.start()].strip(" -")
+            addr = pre[street_m.start():].strip()
+        key = re.sub(r"[^a-z0-9]+", "", name.lower())
+
+        if len(key) >= 4:
+            directory[key] = {
+                "name": name.strip(),
+                "address": addr.strip(),
+                "phone": phone or ""
+            }
+    return directory
+
+def parse_negative_accounts(full_text: str) -> List[NegativeAccount]:
     """
-    Find x-centers of column headers by looking for header tokens within the top part of TRADELINES.
+    Parse TRADELINES blocks for:
+    - COLLECTION
+    - CHARGE OFF
+    Also capture creditor name & account number line preceding, plus key fields.
     """
-    header_band = [r for r in lines if y0 <= r["cy"] <= min(y1, y0 + 180)]
-    cols = {}
-    for token in HEADER_TOKENS:
-        # match token loosely
-        best = None
-        for r in header_band:
-            if token.lower() in r["text"].lower():
-                # pick the widest match if multiple
-                score = (r["x1"] - r["x0"])
-                if best is None or score > best[0]:
-                    best = (score, r["cx"])
-        if best:
-            cols[token] = float(best[1])
-    return cols
+    text = full_text
 
-
-def _looks_like_creditor_line(text: str) -> bool:
-    t = (text or "").strip()
-    if not t:
-        return False
-    # avoid header/cell words
-    for p in CREDITOR_BAD_PREFIXES:
-        if t.startswith(p):
-            return False
-    # creditor names in Birchwood are often ALL CAPS or Title-ish, and not just numbers/dates
-    if re.fullmatch(r"[\d\W]+", t):
-        return False
-    if parse_mm_yy(t):
-        return False
-    return True
-
-
-def _looks_like_account_id(text: str) -> bool:
-    """
-    Birchwood left column often has the account identifier directly under creditor.
-    Usually digits 9+ (example in your screenshot).
-    """
-    s = (text or "").strip()
-    if not s:
-        return False
-    if parse_mm_yy(s):
-        return False
-    if re.fullmatch(r"\d{7,}", s):
-        return True
-    return False
-
-
-def _pick_near_x(lines: List[Dict], x_center: float, y_top: float, y_bot: float, tol: float = 60.0) -> List[str]:
-    """
-    Pick texts in y-range whose center x is within tol of x_center.
-    """
-    picks = []
-    for r in lines:
-        if y_top <= r["cy"] <= y_bot and abs(r["cx"] - x_center) <= tol:
-            picks.append(r["text"])
-    return picks
-
-
-def parse_birchwood_tradelines_structured(pdf_bytes: bytes) -> Tuple[List[Dict], List[str]]:
-    """
-    Returns list of structured tradeline rows:
-      {creditor, acct_raw, opened, reported, balance, bureaus, status_text, snippet}
-    """
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    rows: List[Dict] = []
-    debug: List[str] = []
-    total_candidates = 0
-
-    for pno, page in enumerate(doc, start=1):
-        lines = _flatten_page_lines(page)
-        rng = _find_tradelines_y_range(lines)
-        if not rng:
-            continue
-        y0, y1 = rng
-        tl = [r for r in lines if y0 <= r["cy"] <= y1]
-
-        if not tl:
-            continue
-
-        cols = _detect_header_columns(lines, y0, y1)
-        # we mainly need these
-        opened_x = cols.get("Opened")
-        reported_x = cols.get("Reported")
-        balance_x = cols.get("Balance")
-
-        # define "left creditor column" cutoff using the Opened header if found
-        left_cut = (opened_x - 80) if opened_x else 220.0
-
-        left_lines = [r for r in tl if r["x0"] <= left_cut]
-        left_lines.sort(key=lambda r: (r["y0"], r["x0"]))
-
-        # Detect tradeline starts: creditor line followed shortly by account-id line (below)
-        starts: List[Tuple[int, float]] = []  # (index in left_lines, start_y)
-        for i in range(len(left_lines) - 1):
-            a = left_lines[i]["text"]
-            b = left_lines[i + 1]["text"]
-            if _looks_like_creditor_line(a) and _looks_like_account_id(b):
-                # ensure vertical closeness (same tradeline cell)
-                if 0 < (left_lines[i + 1]["y0"] - left_lines[i]["y0"]) <= 45:
-                    starts.append((i, left_lines[i]["y0"]))
-
-        if not starts:
-            continue
-
-        # build y-ranges per tradeline from start to next start
-        for si, (idx, start_y) in enumerate(starts):
-            end_y = (starts[si + 1][1] - 5) if si + 1 < len(starts) else (y1 - 5)
-            total_candidates += 1
-
-            creditor = left_lines[idx]["text"].strip()
-            acct_raw = left_lines[idx + 1]["text"].strip()
-
-            # Pull opened/reported/balance by column proximity (within tradeline y-range)
-            opened_dt = None
-            reported_dt = None
-            bal = None
-            bureaus = "Unknown"
-
-            # opened
-            if opened_x:
-                opened_vals = _pick_near_x(tl, opened_x, start_y, end_y, tol=70)
-                # pick first MM/YY
-                for v in opened_vals:
-                    d = parse_mm_yy(v)
-                    if d:
-                        opened_dt = d
-                        break
-
-            # reported
-            if reported_x:
-                reported_vals = _pick_near_x(tl, reported_x, start_y, end_y, tol=70)
-                for v in reported_vals:
-                    d = parse_mm_yy(v)
-                    if d:
-                        reported_dt = d
-                        break
-
-            # balance
-            if balance_x:
-                bal_vals = _pick_near_x(tl, balance_x, start_y, end_y, tol=90)
-                # pick first $ amount
-                for v in bal_vals:
-                    m = MONEY_RE.search(v)
-                    if m:
-                        bal = parse_money(m.group(0))
-                        break
-
-            # status text (anywhere in tradeline y-range)
-            status_text_parts = []
-            for r in tl:
-                if start_y <= r["cy"] <= end_y:
-                    status_text_parts.append(r["text"])
-            status_text = " ".join(status_text_parts)
-            # bureaus from source-like text in row
-            bureaus = detect_bureaus_from_text(status_text)
-
-            # snippet (masked)
-            snippet = mask_pii_in_snippet(status_text[:1600])
-
-            rows.append({
-                "page": pno,
-                "creditor": creditor,
-                "acct_raw": acct_raw,
-                "opened": opened_dt,
-                "reported": reported_dt,
-                "balance": bal,
-                "bureaus": bureaus,
-                "status_text": status_text,
-                "snippet": snippet,
-            })
-
-    doc.close()
-    debug.append(f"Structured TRADELINES: parsed {len(rows)} tradeline rows (candidates={total_candidates}).")
-    if len(rows) == 0:
-        debug.append("Structured TRADELINES: 0 rows found. If this was OCR-mode or a scanned PDF, table structure may not be recoverable.")
-    return rows, debug
-
-
-# =============================
-# Parser orchestration (Birchwood-only)
-# =============================
-def parse_negative_accounts_birchwood(pdf_bytes: bytes, extracted_text: str, mode: str) -> Tuple[List[NegativeAccount], List[ParseNote], List[str]]:
-    """
-    Prefer structured parsing when mode==Text.
-    Fallback to text-window parsing when OCR or structured fails.
-    """
-    debug_msgs: List[str] = []
-    notes: List[ParseNote] = []
+    # Extract trade lines chunk(s) after "TRADELINES"
+    # We'll scan globally for patterns
     accounts: List[NegativeAccount] = []
 
-    # 1) Structured parsing for TEXT mode
-    if mode == "Text":
-        rows, dbg = parse_birchwood_tradelines_structured(pdf_bytes)
-        debug_msgs.extend(dbg)
+    # Pattern: creditor name line then account number line then fields (Opened/Reported/Balance/etc)
+    # We'll use a rolling window approach for each match of COLLECTION/CHARGE OFF.
+    tokens = [m.start() for m in re.finditer(r"\b(COLLECTION|CHARGE OFF)\b", text, flags=re.IGNORECASE)]
+    for pos in tokens:
+        window_start = max(0, pos - 500)
+        window_end = min(len(text), pos + 900)
+        win = text[window_start:window_end]
 
-        for i, r in enumerate(rows):
-            is_neg, status = birchwood_negative_status(r.get("status_text", ""))
-            if not is_neg:
-                continue
+        acct_type_m = re.search(r"\b(COLLECTION|CHARGE OFF)\b", win, flags=re.IGNORECASE)
+        if not acct_type_m:
+            continue
+        acct_type = acct_type_m.group(1).upper()
 
-            creditor = r.get("creditor", "").strip()
-            acct_raw = r.get("acct_raw", "").strip()
+        # Try to get creditor + account number above type
+        # Grab up to 10 lines before the type
+        pre = win[:acct_type_m.start()]
+        pre_lines = [normalize_spaces(x) for x in pre.splitlines() if normalize_spaces(x)]
+        creditor = ""
+        acctno = ""
 
-            opened_dt = r.get("opened")
-            reported_dt = r.get("reported")
-            bal = r.get("balance")
-            bureaus = r.get("bureaus", "Unknown")
+        # Heuristic: creditor is one of the last 6 lines, account number is the next line with lots of digits
+        for i in range(len(pre_lines) - 1, max(-1, len(pre_lines) - 10), -1):
+            line = pre_lines[i]
+            if not acctno:
+                # Account numbers often have 8+ digits or alnum ids
+                if re.search(r"\b[0-9A-Z]{8,}\b", line) and not re.search(r"\b(Opened|Reported|Balance|Payment|ECOA|Source)\b", line, re.IGNORECASE):
+                    acctno = re.search(r"\b[0-9A-Z]{8,}\b", line).group(0)
+                    continue
+            if not creditor:
+                if not re.search(r"\b(Opened|Reported|Hi\.|Credit|Limit|Reviewed|DLA|ECOA|Source|30-59|60-89|90\+|Past Due|Payment|Balance)\b", line, re.IGNORECASE):
+                    # creditor names usually have letters
+                    if re.search(r"[A-Za-z]", line):
+                        creditor = line
+                        break
 
-            acct = NegativeAccount(
-                creditor_name=creditor,
-                masked_account_number=mask_account_number(acct_raw),
-                current_balance=bal,
-                last_reported_date=reported_dt,
-                date_opened=opened_dt,
-                age_of_account=calc_age(opened_dt),
-                negative_type_status=status,
-                bureaus=bureaus,
-                estimated_impact="",
-                raw_block_snippet=r.get("snippet", ""),
-            )
-            tier, rng = impact_range_for_account(acct.negative_type_status, acct.last_reported_date, acct.current_balance)
-            acct.estimated_impact = f"{tier}: {rng}"
-            accounts.append(acct)
-            notes.append(ParseNote(block_index=i, notes=[
-                "Structured TRADELINES row parse",
-                f"Page: {r.get('page')}",
-                f"Creditor: {bool(creditor)}",
-                f"Acct#: {bool(acct_raw)}",
-                f"Opened: {bool(opened_dt)}",
-                f"Reported: {bool(reported_dt)}",
-                f"Balance: {bal is not None}",
-                f"Bureaus: {bureaus}",
-                f"Status: {status}",
-            ]))
+        # Fields in window
+        opened = find_field(win, r"\bOpened\s*([0-9]{2}/[0-9]{2})")
+        reported = find_field(win, r"\bReported\s*([0-9]{2}/[0-9]{2})")
+        balance = find_money_field(win, r"\bBalance\s*\$?([0-9,]+)")
+        past_due = find_money_field(win, r"\bPast Due\s*\$?([0-9,]+)")
+        dla = find_field(win, r"\bDLA\s*([0-9]{2}/[0-9]{2})")
+        orig = find_field(win, r"ORIGINAL CREDITOR:\s*([A-Z0-9&\.\-\s]+)")
+        source_bureaus = find_field(win, r"\bSource\s*\(B\)\s*([A-Z/]+)")
 
-        # If we got good results, return them
-        if len(accounts) > 0:
-            return _dedupe_accounts(accounts), notes, debug_msgs
+        notes = []
+        # Common flags
+        for note_pat in [
+            r"CONSUMER DISPUTES THIS ACCOUNT INFORMATION",
+            r"FACTORING COMPANY;.*",
+            r"PROFIT AND LOSS WRITEOFF;.*",
+            r"TRANSFER/SOLD.*",
+            r"CHARGED OFF ACCOUNT.*",
+            r"COLLECTION ACCOUNT.*",
+        ]:
+            nm = re.search(note_pat, win, flags=re.IGNORECASE)
+            if nm:
+                notes.append(normalize_spaces(nm.group(0)))
 
-        debug_msgs.append("Structured TRADELINES produced 0 negatives; falling back to OCR/text-window logic.")
-
-    # 2) Fallback (OCR or structured failed): old-style windows around negative keywords
-    debug_msgs.append("Fallback parsing: using keyword-window blocks (less accurate for Birchwood tables).")
-    blocks = build_keyword_windows(extracted_text)
-    for i, blk in enumerate(blocks):
-        is_neg, status = birchwood_negative_status(blk)
-        if not is_neg:
+        # Avoid duplicates by (creditor, acctno, type, balance)
+        key = (creditor.strip().lower(), acctno.strip().lower(), acct_type, safe_text(balance))
+        if any((a.creditor.strip().lower(), a.account_number.strip().lower(), a.acct_type, safe_text(a.balance)) == key for a in accounts):
             continue
 
-        creditor, acct_raw = guess_creditor_and_acct_from_block(blk)
-        opened_dt = guess_date_after_label(blk, "Opened")
-        reported_dt = guess_date_after_label(blk, "Reported")
-        bal = guess_money_after_label(blk, "Balance")
-        bureaus = detect_bureaus_from_text(blk)
-
-        acct = NegativeAccount(
-            creditor_name=creditor,
-            masked_account_number=mask_account_number(acct_raw),
-            current_balance=bal,
-            last_reported_date=reported_dt,
-            date_opened=opened_dt,
-            age_of_account=calc_age(opened_dt),
-            negative_type_status=status,
-            bureaus=bureaus,
-            estimated_impact="",
-            raw_block_snippet=mask_pii_in_snippet(blk[:1600]),
-        )
-        tier, rng = impact_range_for_account(acct.negative_type_status, acct.last_reported_date, acct.current_balance)
-        acct.estimated_impact = f"{tier}: {rng}"
-        accounts.append(acct)
-        notes.append(ParseNote(block_index=i, notes=["Fallback block parse"]))
-
-    return _dedupe_accounts(accounts), notes, debug_msgs
-
-
-# =============================
-# Fallback helpers (only used when OCR/structured fails)
-# =============================
-NEG_KEYWORDS = ["DELINQ", "CHARGE OFF", "CHARGED OFF", "COLLECTION", "BANKRUPT", "FORECLOS", "REPOS", "JUDG"]
-
-
-def build_keyword_windows(text: str) -> List[str]:
-    t = (text or "").replace("\r\n", "\n")
-    lines = t.splitlines()
-    hit_idxs = []
-    for i, ln in enumerate(lines):
-        u = ln.upper()
-        if any(k in u for k in NEG_KEYWORDS):
-            hit_idxs.append(i)
-
-    windows = []
-    for idx in hit_idxs:
-        s = max(0, idx - 10)
-        e = min(len(lines), idx + 16)
-        windows.append((s, e))
-
-    windows.sort()
-    merged = []
-    for s, e in windows:
-        if not merged or s > merged[-1][1]:
-            merged.append([s, e])
-        else:
-            merged[-1][1] = max(merged[-1][1], e)
-
-    blocks = []
-    for s, e in merged:
-        blk = "\n".join(lines[s:e]).strip()
-        if blk:
-            blocks.append(blk)
-    return blocks if blocks else [t.strip()]
-
-
-def guess_creditor_and_acct_from_block(block: str) -> Tuple[str, str]:
-    lines = [l.strip() for l in (block or "").splitlines() if l.strip()]
-    creditor = ""
-    acct = ""
-    for i in range(min(8, len(lines))):
-        if not creditor and lines[i] and not parse_mm_yy(lines[i]) and not re.fullmatch(r"[\d\W]+", lines[i]):
-            creditor = lines[i][:90]
-        if i + 1 < len(lines) and re.fullmatch(r"\d{7,}", lines[i + 1]):
-            acct = lines[i + 1]
-            break
-    if not acct:
-        m = ACCT_LIKE_RE.search(block or "")
-        acct = m.group(0) if m else ""
-    return creditor, acct
-
-
-def guess_date_after_label(block: str, label: str) -> Optional[date]:
-    m = re.search(rf"(?i)\b{re.escape(label)}\b\s*[:\-]?\s*([0-9]{{1,2}}[/\-][0-9]{{2,4}})", block)
-    return parse_mm_yy(m.group(1)) if m else None
-
-
-def guess_money_after_label(block: str, label: str) -> Optional[float]:
-    m = re.search(rf"(?i)\b{re.escape(label)}\b.*?(\$?\s*[0-9,]+(?:\.[0-9]{{2}})?)", block, flags=re.DOTALL)
-    return parse_money(m.group(1)) if m else None
-
-
-def _dedupe_accounts(accounts: List[NegativeAccount]) -> List[NegativeAccount]:
-    deduped = []
-    seen = set()
-    for a in accounts:
-        key = (
-            (a.creditor_name or "").lower().strip()[:50],
-            a.masked_account_number,
-            (a.negative_type_status or "").lower().strip(),
-            int((a.current_balance or 0.0) // 10),
-            format_date(a.last_reported_date),
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(a)
-    return deduped
-
-
-# =============================
-# Export PDF (ReportLab)
-# =============================
-def build_export_pdf(df: pd.DataFrame, extraction_mode: str, confidence: str, overall_pressure: str) -> bytes:
-    """
-    Export a clean, readable PDF:
-      - Landscape letter to prevent horizontal cutoff
-      - Forced column widths to fit page
-      - Wrapped text cells (Paragraph) so long text doesn't blow out width
-      - Auto shrink-to-fit for unusually long creditor names
-      - Two-page format when needed:
-          Page 1 = Summary
-          Page 2+ = Detailed table (split into chunks if many rows)
-    """
-    from reportlab.lib.pagesizes import letter, landscape
-    from reportlab.platypus import (
-        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
-    )
-    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.lib import colors
-
-    buffer = io.BytesIO()
-    pagesize = landscape(letter)
-
-    doc = SimpleDocTemplate(
-        buffer,
-        pagesize=pagesize,
-        rightMargin=24,
-        leftMargin=24,
-        topMargin=24,
-        bottomMargin=24,
-    )
-
-    styles = getSampleStyleSheet()
-
-    # Base small text style
-    small = ParagraphStyle(
-        "small",
-        parent=styles["Normal"],
-        fontName="Helvetica",
-        fontSize=7.5,
-        leading=9,
-    )
-    small_bold = ParagraphStyle(
-        "small_bold",
-        parent=small,
-        fontName="Helvetica-Bold",
-    )
-
-    # Even smaller style used only when creditor name is unusually long
-    small_tight = ParagraphStyle(
-        "small_tight",
-        parent=small,
-        fontSize=6.8,
-        leading=8.2,
-    )
-
-    def esc(s: str) -> str:
-        return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-    def P(val, bold: bool = False, tight: bool = False):
-        txt = esc("" if val is None else str(val))
-        if bold:
-            return Paragraph(txt, small_bold)
-        if tight:
-            return Paragraph(txt, small_tight)
-        return Paragraph(txt, small)
-
-    cols = [
-        "Creditor", "Acct (Last 4)", "Balance", "Last Reported", "Opened", "Age",
-        "Negative Type/Status", "Bureau(s)", "Estimated Impact"
-    ]
-
-    story = []
-
-    # --------------------
-    # Page 1: Summary
-    # --------------------
-    story.append(Paragraph("Negative Accounts Summary", styles["Title"]))
-    story.append(Spacer(1, 10))
-
-    story.append(Paragraph(
-        f"Extraction Mode: {esc(extraction_mode)} | Confidence: {esc(confidence)} | Overall Negative Pressure: {esc(overall_pressure)}",
-        styles["Normal"]
-    ))
-    story.append(Spacer(1, 10))
-
-    disclaimer = (
-        "Disclaimer: This report is an informational extraction from the uploaded Birchwood credit report PDF. "
-        "Estimated impact ranges are heuristic (not an exact score change) and vary by scoring model, file thickness, "
-        "utilization, and reporting details. Always verify against the source report."
-    )
-    story.append(Paragraph(esc(disclaimer), styles["Italic"]))
-    story.append(Spacer(1, 14))
-
-    # Quick counts (page 1)
-    if df.empty:
-        story.append(Paragraph("No negative accounts detected.", styles["Normal"]))
-        doc.build(story)
-        return buffer.getvalue()
-
-    # Summary stats
-    try:
-        # Balance column is formatted like "$1,234.00" in your df.
-        # Best effort: strip non-numeric to compute total
-        bal_nums = (
-            df["Balance"]
-            .astype(str)
-            .str.replace(r"[^0-9.]", "", regex=True)
-            .replace("", "0")
-            .astype(float)
-        )
-        total_balance = float(bal_nums.sum())
-    except Exception:
-        total_balance = None
-
-    def count_contains(col: str, needle: str) -> int:
-        if col not in df.columns:
-            return 0
-        return int(df[col].astype(str).str.lower().str.contains(needle.lower()).sum())
-
-    n_total = len(df)
-    n_col = count_contains("Negative Type/Status", "collection")
-    n_co = count_contains("Negative Type/Status", "charge")
-    n_late = count_contains("Negative Type/Status", "late")
-
-    summary_table = [
-        ["Total negative accounts", str(n_total)],
-        ["Collections", str(n_col)],
-        ["Charge-offs", str(n_co)],
-        ["Lates", str(n_late)],
-        ["Total negative balance", format_money(total_balance) if total_balance is not None else ""],
-    ]
-
-    summary_tbl = Table(summary_table, colWidths=[250, 200])
-    summary_tbl.setStyle(TableStyle([
-        ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
-        ("BACKGROUND", (0, 0), (-1, -1), colors.whitesmoke),
-        ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
-        ("FONTSIZE", (0, 0), (-1, -1), 10),
-        ("LEFTPADDING", (0, 0), (-1, -1), 6),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-        ("TOPPADDING", (0, 0), (-1, -1), 4),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-    ]))
-    story.append(summary_tbl)
-
-    story.append(Spacer(1, 12))
-    story.append(Paragraph("Detailed table on next page.", styles["Normal"]))
-
-    # --------------------
-    # Page 2+: Detailed table
-    # --------------------
-    story.append(PageBreak())
-    story.append(Paragraph("Detailed Negative Accounts", styles["Heading2"]))
-    story.append(Spacer(1, 8))
-
-    # Force table width to page width
-    page_w, _ = pagesize
-    usable_w = page_w - doc.leftMargin - doc.rightMargin
-
-    # Column width proportions (sum ~ 1.0)
-    proportions = [0.18, 0.09, 0.09, 0.09, 0.08, 0.06, 0.16, 0.10, 0.15]
-    col_widths = [usable_w * p for p in proportions]
-
-    # Build in chunks so extremely long lists don't become unreadable
-    # Each chunk becomes its own table; header repeats automatically per table.
-    max_rows_per_table = 28  # tuned for landscape letter readability
-
-    rows = df[cols].copy()
-
-    # Build data with wrapped paragraphs; shrink creditor font when unusually long
-    def build_table_data(sub_df: pd.DataFrame) -> list:
-        data = [[P(c, bold=True) for c in cols]]
-        for _, r in sub_df.iterrows():
-            creditor_txt = str(r.get("Creditor", "") or "")
-            tight = len(creditor_txt) > 26  # shrink-to-fit threshold
-            data.append([
-                P(creditor_txt, tight=tight),
-                P(r.get("Acct (Last 4)", "")),
-                P(r.get("Balance", "")),
-                P(r.get("Last Reported", "")),
-                P(r.get("Opened", "")),
-                P(r.get("Age", "")),
-                P(r.get("Negative Type/Status", "")),
-                P(r.get("Bureau(s)", "")),
-                P(r.get("Estimated Impact", "")),
-            ])
-        return data
-
-    # Split into multiple tables if too many rows
-    for start in range(0, len(rows), max_rows_per_table):
-        sub = rows.iloc[start:start + max_rows_per_table]
-        table_data = build_table_data(sub)
-
-        tbl = Table(table_data, colWidths=col_widths, repeatRows=1)
-        tbl.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), colors.black),
-            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-            ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
-            ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ("LEFTPADDING", (0, 0), (-1, -1), 4),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-            ("TOPPADDING", (0, 0), (-1, -1), 3),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.lightgrey]),
-        ]))
-
-        story.append(tbl)
-
-        # If more chunks remain, add a page break between them
-        if start + max_rows_per_table < len(rows):
-            story.append(PageBreak())
-            story.append(Paragraph("Detailed Negative Accounts (continued)", styles["Heading2"]))
-            story.append(Spacer(1, 8))
-
-    doc.build(story)
-    return buffer.getvalue()
-
-    cols = [
-        "Creditor", "Acct (Last 4)", "Balance", "Last Reported", "Opened", "Age",
-        "Negative Type/Status", "Bureau(s)", "Estimated Impact"
-    ]
-    table_data = [cols]
-    for _, r in df.iterrows():
-        table_data.append([str(r.get(c, "")) for c in cols])
-
-    tbl = Table(table_data, repeatRows=1)
-    tbl.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.black),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("FONTSIZE", (0, 0), (-1, 0), 9),
-        ("FONTSIZE", (0, 1), (-1, -1), 8),
-        ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.lightgrey]),
-        ("LEFTPADDING", (0, 0), (-1, -1), 4),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-        ("TOPPADDING", (0, 0), (-1, -1), 3),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-    ]))
-    story.append(tbl)
-    doc.build(story)
-    return buffer.getvalue()
-
-
-# =============================
-# UI helpers
-# =============================
-def to_table_df(accounts: List[NegativeAccount]) -> pd.DataFrame:
-    rows = []
-    for a in accounts:
-        rows.append({
-            "Creditor": a.creditor_name,
-            "Acct (Last 4)": a.masked_account_number,
-            "Balance": format_money(a.current_balance),
-            "Last Reported": format_date(a.last_reported_date),
-            "Opened": format_date(a.date_opened),
-            "Age": a.age_of_account,
-            "Negative Type/Status": a.negative_type_status,
-            "Bureau(s)": a.bureaus,
-            "Estimated Impact": a.estimated_impact,
-        })
-    return pd.DataFrame(rows)
-
-
-def build_manual_editor_df(accounts: List[NegativeAccount]) -> pd.DataFrame:
-    rows = []
-    for idx, a in enumerate(accounts):
-        rows.append({
-            "RowID": idx,
-            "Creditor": a.creditor_name,
-            "Acct (Last 4)": a.masked_account_number,
-            "Balance (number)": float(a.current_balance) if a.current_balance is not None else None,
-            "Last Reported (YYYY-MM-DD)": format_date(a.last_reported_date),
-            "Opened (YYYY-MM-DD)": format_date(a.date_opened),
-            "Negative Type/Status": a.negative_type_status,
-            "Bureau(s)": a.bureaus,
-        })
-    return pd.DataFrame(rows)
-
-
-def apply_manual_overrides(base_accounts: List[NegativeAccount], edited_df: pd.DataFrame) -> List[NegativeAccount]:
-    updated = []
-    by_id = {int(r["RowID"]): r for _, r in edited_df.iterrows() if pd.notnull(r.get("RowID"))}
-
-    def parse_iso_or_mm(text: str) -> Optional[date]:
-        if not text:
-            return None
-        try:
-            return datetime.strptime(text, "%Y-%m-%d").date()
-        except ValueError:
-            return parse_mm_yy(text)
-
-    for i, a in enumerate(base_accounts):
-        r = by_id.get(i)
-        if r is None:
-            updated.append(a)
-            continue
-
-        creditor = str(r.get("Creditor") or "").strip()
-        acct_last4 = str(r.get("Acct (Last 4)") or "").strip()
-        bal_num = r.get("Balance (number)")
-        last_s = str(r.get("Last Reported (YYYY-MM-DD)") or "").strip()
-        open_s = str(r.get("Opened (YYYY-MM-DD)") or "").strip()
-        status = str(r.get("Negative Type/Status") or "").strip()
-        bureaus = str(r.get("Bureau(s)") or "").strip()
-
-        last_dt = parse_iso_or_mm(last_s)
-        open_dt = parse_iso_or_mm(open_s)
-
-        bal = None
-        try:
-            if bal_num is not None and not (isinstance(bal_num, float) and math.isnan(bal_num)):
-                bal = float(bal_num)
-        except Exception:
-            bal = None
-
-        tier, rng = impact_range_for_account(status, last_dt, bal)
-        est = f"{tier}: {rng}" if status else ""
-
-        updated.append(NegativeAccount(
-            creditor_name=creditor,
-            masked_account_number=acct_last4 if acct_last4 else a.masked_account_number,
-            current_balance=bal,
-            last_reported_date=last_dt,
-            date_opened=open_dt,
-            age_of_account=calc_age(open_dt),
-            negative_type_status=status,
-            bureaus=bureaus,
-            estimated_impact=est,
-            raw_block_snippet=a.raw_block_snippet,
+        accounts.append(NegativeAccount(
+            creditor=creditor or "UNKNOWN",
+            account_number=acctno or "UNKNOWN",
+            acct_type=acct_type,
+            balance=balance,
+            past_due=past_due,
+            last_reported=reported,
+            opened=opened,
+            dla=dla,
+            original_creditor=orig,
+            source_bureaus=source_bureaus,
+            notes="; ".join(notes) if notes else None,
         ))
-    return updated
+
+    return accounts
+
+def find_field(text: str, pattern: str) -> Optional[str]:
+    m = re.search(pattern, text, flags=re.IGNORECASE)
+    if not m:
+        return None
+    return normalize_spaces(m.group(1))
+
+def find_money_field(text: str, pattern: str) -> Optional[str]:
+    m = re.search(pattern, text, flags=re.IGNORECASE)
+    if not m:
+        return None
+    return "$" + m.group(1).replace(",", "").strip().replace(" ", "")
+
+def parse_scores(full_text: str) -> Dict[str, Optional[int]]:
+    scores = {"TransUnion": None, "Experian": None, "Equifax": None}
+    # Try several patterns
+    for bureau in ["TRANSUNION", "EXPERIAN", "EQUIFAX"]:
+        m = re.search(rf"{bureau}.*?SCORE:\s*([0-9]{{3}})", full_text, flags=re.IGNORECASE | re.DOTALL)
+        if m:
+            val = int(m.group(1))
+            if bureau == "TRANSUNION": scores["TransUnion"] = val
+            if bureau == "EXPERIAN": scores["Experian"] = val
+            if bureau == "EQUIFAX": scores["Equifax"] = val
+    return scores
+
+def rank_and_attach_strategies(accounts: List[NegativeAccount], directory: Dict[str, Dict[str, str]]) -> List[NegativeAccount]:
+    """
+    Rank:
+      1) Collections (esp smaller balances) first
+      2) Charge-offs next (smaller balances first)
+    Attach:
+      - contact phone/address from directory if match
+      - strategy text
+    """
+    def dir_lookup(name: str) -> Dict[str, str]:
+        key = re.sub(r"[^a-z0-9]+", "", name.lower())
+        # try exact, then partial
+        if key in directory:
+            return directory[key]
+        for k, v in directory.items():
+            if key and (key in k or k in key):
+                return v
+        return {}
+
+    # Compute sort key
+    def sort_key(a: NegativeAccount):
+        bal = money_to_float(a.balance) if a.balance else 999999.0
+        if a.acct_type == "COLLECTION":
+            return (0, bal)
+        if a.acct_type == "CHARGE OFF":
+            return (1, bal)
+        return (2, bal)
+
+    sorted_acc = sorted(accounts, key=sort_key)
+
+    for idx, a in enumerate(sorted_acc, start=1):
+        a.priority_rank = idx
+        d = dir_lookup(a.creditor)
+        if d:
+            a.contact_phone = d.get("phone") or None
+            a.contact_address = d.get("address") or None
+
+        if a.acct_type == "COLLECTION":
+            # Offer ~35-60% settlement if not tiny; tiny often can do 60-80% for fast delete
+            bal = money_to_float(a.balance) if a.balance else None
+            if bal is not None and bal <= 300:
+                settle = "60–80%"
+            else:
+                settle = "35–55%"
+            a.strategy = (
+                f"Call and negotiate a Pay-For-Delete. Target settlement around {settle} of balance. "
+                f"Ask for deletion from all three bureaus in writing (email/letter) before paying."
+            )
+        elif a.acct_type == "CHARGE OFF":
+            a.strategy = (
+                "Charge-offs rarely delete on request. Best play: negotiate settlement (or pay in full if needed for underwriting), "
+                "then follow with a goodwill request OR dispute any inaccurate payment history/balance/status. "
+                "If a third-party collector also reports, prioritize deleting the collection tradeline."
+            )
+        else:
+            a.strategy = "Investigate and address serious delinquency with goodwill/dispute as appropriate."
+
+    return sorted_acc
+
+def build_word_doc(client_name: str, scores: Dict[str, Optional[int]],
+                   accounts: List[NegativeAccount], extraction_mode: str) -> bytes:
+    doc = Document()
+    doc.add_heading(f"Credit Repair Action Plan – {client_name}", level=1)
+
+    doc.add_paragraph(f"Extraction mode used: {extraction_mode}")
+    doc.add_heading("Current Scores", level=2)
+    doc.add_paragraph(
+        f"TransUnion: {scores.get('TransUnion') or 'N/A'}\n"
+        f"Experian: {scores.get('Experian') or 'N/A'}\n"
+        f"Equifax: {scores.get('Equifax') or 'N/A'}"
+    )
+
+    doc.add_heading("Priority Repair List (Easiest → Hardest)", level=2)
+
+    for a in accounts:
+        title = f"{a.priority_rank}. {a.creditor} — {a.acct_type}"
+        doc.add_heading(title, level=3)
+
+        doc.add_paragraph(f"Account Number: {a.account_number}")
+        if a.original_creditor:
+            doc.add_paragraph(f"Original Creditor: {a.original_creditor}")
+        if a.balance:
+            doc.add_paragraph(f"Balance: {a.balance}")
+        if a.past_due and a.past_due != "$0":
+            doc.add_paragraph(f"Past Due: {a.past_due}")
+        if a.opened:
+            doc.add_paragraph(f"Opened: {a.opened}")
+        if a.last_reported:
+            doc.add_paragraph(f"Last Reported: {a.last_reported}")
+        if a.dla:
+            doc.add_paragraph(f"DLA: {a.dla}")
+        if a.source_bureaus:
+            doc.add_paragraph(f"Reporting (Source): {a.source_bureaus}")
+
+        if a.contact_phone or a.contact_address:
+            doc.add_paragraph(f"Contact Phone: {a.contact_phone or 'N/A'}")
+            doc.add_paragraph(f"Contact Address: {a.contact_address or 'N/A'}")
+
+        if a.notes:
+            doc.add_paragraph(f"Notes: {a.notes}")
+
+        doc.add_paragraph(f"Strategy: {a.strategy or ''}")
+
+    doc.add_heading("30–60 Day Timeline", level=2)
+    doc.add_paragraph(
+        "Week 1: Resolve the smallest collections first (highest deletion probability).\n"
+        "Week 2: Negotiate remaining collections; confirm deletions in writing.\n"
+        "Week 3: Address charge-offs (settlement / pay-in-full if needed) + send goodwill letters.\n"
+        "Week 4: Dispute any inaccurate items; monitor for deletions and updates."
+    )
+
+    doc.add_heading("Score Boost Tips", level=2)
+    doc.add_paragraph(
+        "- Keep revolving utilization under 10%.\n"
+        "- Avoid new inquiries unless needed.\n"
+        "- Make every payment on time.\n"
+        "- Consider adding a strong authorized user tradeline (seasoned card) if appropriate."
+    )
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
 
 
-# =============================
-# Streamlit UI
-# =============================
-st.title("📄 Birchwood Negative Accounts Extractor")
-st.caption("Birchwood-only. Uses coordinate-aware table parsing in Text mode; OCR fallback available for scanned PDFs.")
+# ----------------------------
+# Streamlit App
+# ----------------------------
+st.set_page_config(page_title="Birchwood Credit Report Analyzer", layout="wide")
+st.title("Birchwood Credit Report Analyzer")
+st.caption("Upload a Birchwood 'Merged Infile Credit Report' PDF → get negative accounts + ranked repair plan + Word doc.")
 
-uploaded = st.file_uploader("Upload a Birchwood credit report PDF", type=["pdf"])
-if uploaded is None:
-    st.info("Upload a PDF to begin.")
+colA, colB = st.columns([2, 1])
+with colB:
+    st.subheader("Settings")
+    use_ocr = st.checkbox("Force OCR (slower, for scanned PDFs)", value=False)
+    ocr_max_pages = st.slider("OCR max pages", 1, 25, 12)
+    st.write("Tip: leave OCR off unless the report is image-only.")
+
+with colA:
+    uploaded = st.file_uploader("Upload Birchwood credit report PDF", type=["pdf"])
+
+if not uploaded:
     st.stop()
 
-pdf_bytes = uploaded.getvalue()
+pdf_bytes = uploaded.read()
 
-if "state" not in st.session_state:
-    st.session_state.state = {}
-state = st.session_state.state
+# Extract
+primary_full, primary_pages = extract_text_pymupdf(pdf_bytes)
+ocr_full, ocr_pages = ("", [])
+mode = "TEXT"
+if use_ocr or len(primary_full.strip()) < 500:
+    ocr_full, ocr_pages = ocr_pdf_pages(pdf_bytes, max_pages=ocr_max_pages)
 
-with st.spinner("Extracting text..."):
-    text_primary = extract_text_pymupdf(pdf_bytes)
-    mode = "Text"
-    extracted_text = text_primary
-    if len(text_primary.strip()) < 1200:
-        with st.spinner("Low text detected. Running OCR fallback..."):
-            extracted_text = extract_text_ocr(pdf_bytes)
-            mode = "OCR"
+full_text, page_texts, extraction_mode = choose_best_text(primary_full, primary_pages, ocr_full, ocr_pages)
 
-with st.spinner("Parsing negative accounts (Birchwood)..."):
-    accounts, parse_notes, debug_msgs = parse_negative_accounts_birchwood(pdf_bytes, extracted_text, mode)
-    confidence, conf_debug = compute_confidence(extracted_text, accounts)
+if not looks_like_birchwood(full_text) and not use_ocr:
+    st.warning("This doesn't look like a Birchwood merged infile report, but I’ll still try to parse it.")
 
-state["extraction_mode"] = mode
-state["confidence"] = confidence
-state["base_accounts"] = accounts
-state["parse_notes"] = parse_notes
-state["conf_debug"] = conf_debug
-state["debug_msgs"] = debug_msgs
+# Parse basics
+scores = parse_scores(full_text)
+directory = parse_creditors_directory(full_text)
 
-# Manual editor state init
-if "manual_df" not in state:
-    state["manual_df"] = build_manual_editor_df(accounts)
+raw_accounts = parse_negative_accounts(full_text)
+ranked = rank_and_attach_strategies(raw_accounts, directory)
 
-final_accounts = apply_manual_overrides(state["base_accounts"], state["manual_df"])
-final_df = to_table_df(final_accounts)
+# Client name (best effort)
+client_name = "Client"
+name_m = re.search(r"\bAPPLICANT\s+([A-Z][A-Z'\-]+,\s*[A-Z][A-Z'\-]+)", full_text, flags=re.IGNORECASE)
+if name_m:
+    client_name = normalize_spaces(name_m.group(1).title())
 
-# Metrics
-def count_type(substr: str) -> int:
-    s = substr.lower()
-    return sum(1 for a in final_accounts if s in (a.negative_type_status or "").lower())
+st.subheader("Summary")
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("TransUnion", scores.get("TransUnion") or 0)
+c2.metric("Experian", scores.get("Experian") or 0)
+c3.metric("Equifax", scores.get("Equifax") or 0)
+c4.metric("Negative Accounts Found", len(ranked))
 
-num_neg = len(final_accounts)
-num_col = count_type("collection")
-num_co = count_type("charge-off") + count_type("charge off")
-num_late = sum(1 for a in final_accounts if "late" in (a.negative_type_status or "").lower())
-total_bal = sum((a.current_balance or 0.0) for a in final_accounts)
-overall_pressure = overall_negative_pressure(final_accounts)
+st.caption(f"Extraction used: **{extraction_mode}**")
 
-c1, c2, c3, c4, c5, c6 = st.columns(6)
-c1.metric("# Negative Accounts", num_neg)
-c2.metric("# Collections", num_col)
-c3.metric("# Charge-offs", num_co)
-c4.metric("# Lates", num_late)
-c5.metric("Total Negative Balance", format_money(total_bal))
-c6.metric("Mode / Confidence", f"{mode} / {confidence}")
+if len(ranked) == 0:
+    st.error("No collections or charge-offs detected. If this is a scanned report, try enabling OCR.")
+    st.stop()
 
-tab1, tab2, tab3 = st.tabs(["Negative Accounts", "Manual Fix", "Debug"])
+st.subheader("Priority Repair List (Easiest → Hardest)")
+for a in ranked:
+    with st.expander(f"{a.priority_rank}. {a.creditor} — {a.acct_type} — Balance: {a.balance or 'N/A'}", expanded=False):
+        st.write({
+            "Creditor": a.creditor,
+            "Account Number": a.account_number,
+            "Type": a.acct_type,
+            "Balance": a.balance,
+            "Past Due": a.past_due,
+            "Opened": a.opened,
+            "Last Reported": a.last_reported,
+            "DLA": a.dla,
+            "Original Creditor": a.original_creditor,
+            "Reporting": a.source_bureaus,
+            "Contact Phone": a.contact_phone,
+            "Contact Address": a.contact_address,
+            "Notes": a.notes,
+        })
+        st.markdown(f"**Strategy:** {a.strategy}")
 
-with tab1:
-    st.subheader("Negative Accounts")
-    if final_df.empty:
-        st.warning("No negative accounts detected.")
-    else:
-        st.dataframe(final_df, use_container_width=True, hide_index=True)
+st.subheader("Download Word Doc Action Plan")
+doc_bytes = build_word_doc(client_name=client_name, scores=scores, accounts=ranked, extraction_mode=extraction_mode)
 
-        st.divider()
-        st.subheader("Account Snippets (for troubleshooting)")
-        for i, a in enumerate(final_accounts, start=1):
-            title = f"{i}. {a.creditor_name or 'Unknown Creditor'} — {a.negative_type_status or 'Unknown Status'} — {a.masked_account_number}"
-            with st.expander(title):
-                st.caption("Raw row snippet (PII-masked):")
-                st.code(a.raw_block_snippet or "", language="text")
+st.download_button(
+    label="Download Credit Repair Action Plan (.docx)",
+    data=doc_bytes,
+    file_name=f"{re.sub(r'[^a-zA-Z0-9]+','_',client_name).strip('_')}_credit_repair_action_plan.docx",
+    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+)
 
-    st.divider()
-    pdf_bytes_out = build_export_pdf(final_df, mode, confidence, overall_pressure)
-    st.download_button(
-        "⬇️ Export PDF: Negative Accounts Summary.pdf",
-        data=pdf_bytes_out,
-        file_name="Negative Accounts Summary.pdf",
-        mime="application/pdf",
-        use_container_width=True,
-    )
-
-with tab2:
-    st.subheader("Manual Fix (Live Overrides)")
-    st.caption("Edit values below to override parsing. Account numbers remain masked (last 4).")
-
-    editable = st.data_editor(
-        state["manual_df"],
-        use_container_width=True,
-        hide_index=True,
-        num_rows="fixed",
-        column_config={
-            "RowID": st.column_config.NumberColumn("RowID", disabled=True),
-            "Balance (number)": st.column_config.NumberColumn("Balance (number)", format="%.2f", step=1.0),
-            "Last Reported (YYYY-MM-DD)": st.column_config.TextColumn("Last Reported (YYYY-MM-DD)"),
-            "Opened (YYYY-MM-DD)": st.column_config.TextColumn("Opened (YYYY-MM-DD)"),
-        },
-        key="manual_editor",
-    )
-    state["manual_df"] = editable
-
-    st.divider()
-    updated_accounts = apply_manual_overrides(state["base_accounts"], state["manual_df"])
-    st.subheader("Preview: Updated Negative Accounts Table")
-    st.dataframe(to_table_df(updated_accounts), use_container_width=True, hide_index=True)
-
-with tab3:
-    st.subheader("Debug")
-
-    for msg in state.get("debug_msgs", []):
-        st.info(msg)
-
-    st.markdown("### Extraction Details")
-    st.write({
-        "Extraction Mode": mode,
-        "Confidence": confidence,
-        "Text Length": int(state["conf_debug"]["text_length"]),
-        "Completion Rate": round(state["conf_debug"]["completion_rate"], 3),
-        "Confidence Score": round(state["conf_debug"]["score"], 3),
-        "Parsed Negative Accounts": len(state["base_accounts"]),
-    })
-
-    st.markdown("### Field Extraction Notes")
-    note_rows = [{"Row/Block": n.block_index, "Notes": " | ".join(n.notes)} for n in state["parse_notes"]]
-    st.dataframe(pd.DataFrame(note_rows), use_container_width=True, hide_index=True)
-
-    st.markdown("### Raw Extracted Text Preview (PII-masked best-effort)")
-    st.code(mask_pii_in_snippet((extracted_text or "")[:12000]), language="text")
+with st.expander("Debug (extracted text preview)"):
+    st.text(full_text[:6000])
